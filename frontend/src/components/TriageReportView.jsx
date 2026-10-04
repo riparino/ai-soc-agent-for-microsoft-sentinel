@@ -214,31 +214,39 @@ ${actionList}
   // High-Resolution Styled Forensic PDF Export with Low-Level RCA
   const handleDownloadPDF = () => {
     setDownloadMenuOpen(false);
-    const tacticsHtml = report.mitre_attack?.tactics?.map(t => `<span class="badge badge-tactic">${t}</span>`).join(' ') || 'None';
-    const techniquesHtml = report.mitre_attack?.techniques?.map(t => `<span class="badge badge-technique">${t}</span>`).join(' ') || 'None';
+    // Escape every value interpolated into the exported HTML document. Report
+    // fields can contain attacker-influenced incident telemetry (command lines,
+    // mail subjects, URLs) or arbitrary analyst-edited text, and are written via
+    // document.write into a same-origin window; without escaping that is a
+    // stored-XSS sink that can read the JWT from localStorage.
+    const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => (
+      { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+    ));
+    const tacticsHtml = report.mitre_attack?.tactics?.map(t => `<span class="badge badge-tactic">${esc(t)}</span>`).join(' ') || 'None';
+    const techniquesHtml = report.mitre_attack?.techniques?.map(t => `<span class="badge badge-technique">${esc(t)}</span>`).join(' ') || 'None';
     const evidenceHtml = report.evidence_findings?.map((e, idx) => `
       <div class="evidence-item">
         <span class="evidence-num">#${idx + 1}</span>
-        <span class="evidence-text">${e}</span>
+        <span class="evidence-text">${esc(e)}</span>
       </div>
     `).join('') || '<p>No specific forensic indicators recorded.</p>';
 
     const actionsHtml = report.recommended_actions?.map(a => `
       <li class="action-item">
         <span class="checkbox">✓</span>
-        <span>${a}</span>
+        <span>${esc(a)}</span>
       </li>
     `).join('') || '<li>No immediate containment required.</li>';
 
     const kqlHtml = report.kql_queries_used?.map(q => `
-      <pre class="kql-block"><code>${q}</code></pre>
+      <pre class="kql-block"><code>${esc(q)}</code></pre>
     `).join('') || '<p>No standalone KQL queries recorded.</p>';
 
     const processTreeHtml = rca.process_tree?.map(p => `
       <div style="background:#F1F5F9; border:1px solid #CBD5E1; padding:8px 10px; border-radius:4px; margin-bottom:6px; font-family:'JetBrains Mono',monospace; font-size:10px;">
-        <div><strong>PID ${p.pid}:</strong> <code style="color:#2563EB;">${p.process}</code></div>
-        <div style="color:#64748B; word-break:break-all; margin-top:2px;">Command: ${p.command}</div>
-        ${p.decoded ? `<div style="margin-top:4px; padding:4px; background:#0B0F19; color:#67E8F9; border-radius:3px;"><strong>Decoded Payload:</strong> ${p.decoded}</div>` : ''}
+        <div><strong>PID ${esc(p.pid)}:</strong> <code style="color:#2563EB;">${esc(p.process)}</code></div>
+        <div style="color:#64748B; word-break:break-all; margin-top:2px;">Command: ${esc(p.command)}</div>
+        ${p.decoded ? `<div style="margin-top:4px; padding:4px; background:#0B0F19; color:#67E8F9; border-radius:3px;"><strong>Decoded Payload:</strong> ${esc(p.decoded)}</div>` : ''}
       </div>
     `).join('') || '<p>No process tree captured.</p>';
 
@@ -253,7 +261,7 @@ ${actionList}
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Sentinel_RCA_Incident_${incident?.incidentNumber || 'Report'}</title>
+  <title>Sentinel_RCA_Incident_${esc(incident?.incidentNumber || 'Report')}</title>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap');
     @page { size: A4; margin: 15mm; }
@@ -292,20 +300,20 @@ ${actionList}
   </table>
 
   <div class="report-meta-box" style="grid-template-columns: repeat(5, 1fr);">
-    <div><div class="meta-label">Incident</div><div class="meta-val">#${incident?.incidentNumber || 'N/A'}</div></div>
-    <div><div class="meta-label">Created Time (${getTimezoneShortLabel(tz)})</div><div class="meta-val">${formatDateTime(incident?.createdTimeUtc, tz, 'short')}</div></div>
-    <div><div class="meta-label">Assessed Severity</div><div class="meta-val" style="color:${verdictMeta.color}">${report.severity_assessment || incident?.severity || 'Medium'}</div></div>
-    <div><div class="meta-label">Patient Zero</div><div class="meta-val">${rca.patient_zero || 'Identified'}</div></div>
-    <div><div class="meta-label">Triage Confidence</div><div class="meta-val">${report.confidence_score}%</div></div>
+    <div><div class="meta-label">Incident</div><div class="meta-val">#${esc(incident?.incidentNumber || 'N/A')}</div></div>
+    <div><div class="meta-label">Created Time (${esc(getTimezoneShortLabel(tz))})</div><div class="meta-val">${esc(formatDateTime(incident?.createdTimeUtc, tz, 'short'))}</div></div>
+    <div><div class="meta-label">Assessed Severity</div><div class="meta-val" style="color:${verdictMeta.color}">${esc(report.severity_assessment || incident?.severity || 'Medium')}</div></div>
+    <div><div class="meta-label">Patient Zero</div><div class="meta-val">${esc(rca.patient_zero || 'Identified')}</div></div>
+    <div><div class="meta-label">Triage Confidence</div><div class="meta-val">${esc(report.confidence_score)}%</div></div>
   </div>
 
   <div class="verdict-card">
-    <div><div style="font-size:8px; font-weight:700; color:#64748B;">FORENSIC VERDICT</div><div class="verdict-title">${verdictMeta.label}</div></div>
-    <div style="font-size:18px; font-weight:900; font-family:'JetBrains Mono', monospace;">${report.confidence_score}%</div>
+    <div><div style="font-size:8px; font-weight:700; color:#64748B;">FORENSIC VERDICT</div><div class="verdict-title">${esc(verdictMeta.label)}</div></div>
+    <div style="font-size:18px; font-weight:900; font-family:'JetBrains Mono', monospace;">${esc(report.confidence_score)}%</div>
   </div>
 
   <div class="section-title">2. Patient Zero & Initial Attack Vector</div>
-  <p><strong>Vector:</strong> ${rca.initial_access_vector || incident?.description || 'Security anomaly detected by Sentinel analytic rule.'}</p>
+  <p><strong>Vector:</strong> ${esc(rca.initial_access_vector || incident?.description || 'Security anomaly detected by Sentinel analytic rule.')}</p>
 
   ${rca.process_tree && rca.process_tree.length > 0 ? `
   <div class="section-title">3. Low-Level Process Lineage & Subprocess Execution Tree</div>
@@ -315,9 +323,9 @@ ${actionList}
   ${rca.network_c2_telemetry?.destination_ip && rca.network_c2_telemetry?.destination_ip !== 'No External C2 Observed' ? `
   <div class="section-title">4. Network Egress & C2 Telemetry</div>
   <div style="background:#F8FAFC; border:1px solid #E2E8F0; padding:8px 10px; border-radius:4px; font-family:'JetBrains Mono', monospace; font-size:10px;">
-    <div><strong>Destination IP / Endpoint:</strong> ${rca.network_c2_telemetry.destination_ip}:${rca.network_c2_telemetry.port || 443} (${rca.network_c2_telemetry.protocol || 'HTTPS'})</div>
-    <div><strong>Reputation / Category:</strong> ${rca.network_c2_telemetry.reputation || 'Correlated Network Node'}</div>
-    <div><strong>Data Transferred:</strong> ${rca.network_c2_telemetry.bytes_transferred || 'Telemetry Stream'}</div>
+    <div><strong>Destination IP / Endpoint:</strong> ${esc(rca.network_c2_telemetry.destination_ip)}:${esc(rca.network_c2_telemetry.port || 443)} (${esc(rca.network_c2_telemetry.protocol || 'HTTPS')})</div>
+    <div><strong>Reputation / Category:</strong> ${esc(rca.network_c2_telemetry.reputation || 'Correlated Network Node')}</div>
+    <div><strong>Data Transferred:</strong> ${esc(rca.network_c2_telemetry.bytes_transferred || 'Telemetry Stream')}</div>
   </div>
   ` : ''}
 

@@ -55,10 +55,10 @@ async def get_system_status(current_user: User = Depends(get_current_user)):
     )
 
     def mask_key(k: Optional[str]) -> str:
+        # Never return a secret's cleartext over the API, even to admins. The
+        # value is write-only from the portal; callers see only whether it is set.
         if not k:
             return ""
-        if is_admin:
-            return k
         return "••••••••••••••••"
 
     return {
@@ -88,9 +88,8 @@ async def get_system_status(current_user: User = Depends(get_current_user)):
             "virustotal_configured": bool(settings.VIRUSTOTAL_API_KEY),
             "microsoft_ti_enabled": bool(settings.ENABLE_MICROSOFT_THREAT_INTEL),
             "mdti_configured": bool(settings.MDTI_API_KEY),
-            "abuseipdb_api_key": mask_key(settings.ABUSEIPDB_API_KEY),
-            "virustotal_api_key": mask_key(settings.VIRUSTOTAL_API_KEY),
-            "mdti_api_key": mask_key(settings.MDTI_API_KEY),
+            # Secret key values are intentionally NOT returned; the UI shows only
+            # the *_configured booleans and treats the inputs as write-only.
             "status": "ACTIVE" if (settings.ABUSEIPDB_API_KEY or settings.VIRUSTOTAL_API_KEY or settings.ENABLE_MICROSOFT_THREAT_INTEL) else "SIMULATED / DEMO FEEDS"
         },
         "auto_triage": {

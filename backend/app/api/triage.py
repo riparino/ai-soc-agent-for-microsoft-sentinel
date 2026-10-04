@@ -3,6 +3,7 @@ from fastapi.responses import Response, HTMLResponse
 from typing import List, Dict, Any, Optional
 import json
 from datetime import datetime
+from html import escape as _esc
 from pydantic import BaseModel
 from app.auth.jwt_handler import get_current_user, User
 from app.services.sentinel_client import sentinel_client
@@ -64,11 +65,23 @@ async def update_triage_report(
     updated_report: Dict[str, Any],
     current_user: User = Depends(get_current_user)
 ):
-    """Allow SOC Analyst to directly edit and save the triage report from the portal"""
+    """Allow SOC Analyst to directly edit and save the triage report from the portal.
+
+    The report is stored verbatim and later rendered; all HTML render paths now
+    escape it, but we still bound the payload size to prevent cache-stuffing.
+    """
     incident = await sentinel_client.get_incident(incident_id)
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
-    
+
+    if not isinstance(updated_report, dict):
+        raise HTTPException(status_code=422, detail="Report body must be a JSON object.")
+    try:
+        if len(json.dumps(updated_report)) > 200_000:
+            raise HTTPException(status_code=413, detail="Report payload too large.")
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="Report body must be JSON-serializable.")
+
     updated_report["last_edited_by"] = f"{current_user.username} ({current_user.role})"
     updated_report["last_edited_at"] = datetime.utcnow().isoformat() + "Z"
     TRIAGE_REPORTS_CACHE[incident_id] = updated_report
@@ -120,12 +133,15 @@ async def download_triage_report(
         if p.get("decoded"):
             process_tree_text += f"\n  - *Decoded Payload:* `{p.get('decoded')}`"
 
+    # Note: process_tree_html is rendered as HTML (format=html export below), so
+    # every interpolated field is HTML-escaped to prevent stored XSS from
+    # attacker-influenced or analyst-edited report data.
     process_tree_html = ""
     for p in rca.get("process_tree", []):
-        decoded_block = f"<div style='margin-top:4px; padding:6px; background:#0B0F19; color:#67E8F9; border-radius:4px;'><strong>Decoded Payload:</strong> <code>{p.get('decoded')}</code></div>" if p.get('decoded') else ""
+        decoded_block = f"<div style='margin-top:4px; padding:6px; background:#0B0F19; color:#67E8F9; border-radius:4px;'><strong>Decoded Payload:</strong> <code>{_esc(str(p.get('decoded', '')))}</code></div>" if p.get('decoded') else ""
         process_tree_html += f"""<div style='background:#F1F5F9; border:1px solid #CBD5E1; padding:8px 12px; border-radius:6px; margin-bottom:8px; font-family:monospace; font-size:11px;'>
-          <div><strong>PID {p.get('pid')}:</strong> <code style='color:#2563EB;'>{p.get('process')}</code></div>
-          <div style='color:#64748B; word-break:break-all; margin-top:2px;'>Command: {p.get('command')}</div>
+          <div><strong>PID {_esc(str(p.get('pid', '')))}:</strong> <code style='color:#2563EB;'>{_esc(str(p.get('process', '')))}</code></div>
+          <div style='color:#64748B; word-break:break-all; margin-top:2px;'>Command: {_esc(str(p.get('command', '')))}</div>
           {decoded_block}
         </div>"""
 
@@ -136,11 +152,33 @@ async def download_triage_report(
     if format == "html":
         verdict = report.get("verdict", "UNKNOWN")
         v_color = "#DC2626" if verdict == "TRUE_POSITIVE" else "#059669" if verdict == "FALSE_POSITIVE" else "#D97706"
+
+        # HTML-escape every data field interpolated into the document. These
+        # values originate from the incident, the LLM, or analyst edits via
+        # PUT /triage/{id}/report, and are returned as text/html; without
+        # escaping this is a stored/reflected XSS sink.
+        e_inc = _esc(str(inc_num))
+        e_title = _esc(str(incident.get("title") or ""))
+        e_verdict = _esc(str(verdict))
+        e_severity = _esc(str(report.get("severity_assessment", incident.get("severity")) or ""))
+        e_patient = _esc(str(patient_zero or ""))
+        e_conf = _esc(str(report.get("confidence_score")))
+        e_summary = _esc(str(report.get("executive_summary") or ""))
+        e_vector = _esc(str(attack_vector or ""))
+        e_tactics = _esc(str(tactics))
+        e_techniques = _esc(str(techniques))
+        e_evidence = _esc(str(evidence))
+        e_capa = _esc(str(capa_actions))
+        e_c2_ip = _esc(str(c2_telemetry.get("destination_ip", "No External IP")))
+        e_c2_proto = _esc(str(c2_telemetry.get("protocol", "HTTPS")))
+        e_c2_rep = _esc(str(c2_telemetry.get("reputation", "Cloud Control Plane / Audit Record")))
+        e_c2_bytes = _esc(str(c2_telemetry.get("bytes_transferred", "Audit Event")))
+
         html_doc = f"""<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Sentinel_RCA_Incident_{inc_num}</title>
+  <title>Sentinel_RCA_Incident_{e_inc}</title>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap');
     body {{ font-family: 'Inter', system-ui, sans-serif; padding: 24px; color: #0F172A; max-width: 860px; margin: auto; font-size: 12px; line-height: 1.5; }}
@@ -158,50 +196,58 @@ async def download_triage_report(
   <div class="header">
     <div>
       <h2 style="margin: 0 0 4px 0;">🛡️ Microsoft Sentinel SOC Root Cause Analysis (RCA)</h2>
-      <p style="margin: 0; color: #64748B;">Incident #{inc_num}: {incident.get("title")}</p>
+      <p style="margin: 0; color: #64748B;">Incident #{e_inc}: {e_title}</p>
     </div>
     <div style="font-size: 10px; font-weight: 700; color: #DC2626;">RESTRICTED // SOC RCA</div>
   </div>
 
   <div class="meta-box">
-    <div><div class="meta-label">Incident Number</div><div class="meta-val">#{inc_num}</div></div>
-    <div><div class="meta-label">Assessed Severity</div><div class="meta-val" style="color: {v_color};">{report.get("severity_assessment", incident.get("severity"))}</div></div>
-    <div><div class="meta-label">Patient Zero</div><div class="meta-val">{patient_zero}</div></div>
-    <div><div class="meta-label">Confidence</div><div class="meta-val">{report.get("confidence_score")}%</div></div>
+    <div><div class="meta-label">Incident Number</div><div class="meta-val">#{e_inc}</div></div>
+    <div><div class="meta-label">Assessed Severity</div><div class="meta-val" style="color: {v_color};">{e_severity}</div></div>
+    <div><div class="meta-label">Patient Zero</div><div class="meta-val">{e_patient}</div></div>
+    <div><div class="meta-label">Confidence</div><div class="meta-val">{e_conf}%</div></div>
   </div>
 
   <div class="verdict">
-    <div><div style="font-size: 9px; font-weight: 700; color: #64748B;">FORENSIC VERDICT</div><strong style="color: {v_color}; font-size: 16px;">{verdict}</strong></div>
-    <div style="font-size: 20px; font-weight: 800; font-family: monospace;">{report.get("confidence_score")}%</div>
+    <div><div style="font-size: 9px; font-weight: 700; color: #64748B;">FORENSIC VERDICT</div><strong style="color: {v_color}; font-size: 16px;">{e_verdict}</strong></div>
+    <div style="font-size: 20px; font-weight: 800; font-family: monospace;">{e_conf}%</div>
   </div>
 
   <div class="sec-title">1. Executive Summary & Root Cause Assessment</div>
-  <div class="box">{report.get("executive_summary")}</div>
+  <div class="box">{e_summary}</div>
 
   <div class="sec-title">2. Patient Zero & Initial Attack Vector</div>
-  <p><strong>Vector:</strong> {attack_vector}</p>
+  <p><strong>Vector:</strong> {e_vector}</p>
 
   {f'<div class="sec-title">3. Low-Level Process Execution Lineage & Subprocess Tree</div>{process_tree_html}' if process_tree_html else ''}
 
   {f'''<div class="sec-title">4. Network / Origin Telemetry</div>
   <div style="background:#F8FAFC; border:1px solid #E2E8F0; padding:10px 12px; border-radius:6px; font-family:monospace; font-size:11px;">
-    <div><strong>Origin / Dest IP:</strong> {c2_telemetry.get("destination_ip", "No External IP")} ({c2_telemetry.get("protocol", "HTTPS")})</div>
-    <div><strong>Reputation / Category:</strong> {c2_telemetry.get("reputation", "Cloud Control Plane / Audit Record")}</div>
-    <div><strong>Telemetry:</strong> {c2_telemetry.get("bytes_transferred", "Audit Event")}</div>
+    <div><strong>Origin / Dest IP:</strong> {e_c2_ip} ({e_c2_proto})</div>
+    <div><strong>Reputation / Category:</strong> {e_c2_rep}</div>
+    <div><strong>Telemetry:</strong> {e_c2_bytes}</div>
   </div>''' if c2_telemetry.get("destination_ip") and c2_telemetry.get("destination_ip") != "No External C2 Observed" else ''}
 
   <div class="sec-title">5. MITRE ATT&CK Alignment</div>
-  <p><strong>Tactics:</strong> {tactics}</p>
-  <p><strong>Techniques:</strong> {techniques}</p>
+  <p><strong>Tactics:</strong> {e_tactics}</p>
+  <p><strong>Techniques:</strong> {e_techniques}</p>
 
   <div class="sec-title">6. Key Forensic Telemetry Findings</div>
-  <pre style="background:#F8FAFC; color:#0F172A; border:1px solid #E2E8F0;">{evidence}</pre>
+  <pre style="background:#F8FAFC; color:#0F172A; border:1px solid #E2E8F0;">{e_evidence}</pre>
 
   <div class="sec-title">7. Corrective & Preventive Action Plan (CAPA)</div>
-  <pre style="background:#F8FAFC; color:#0F172A; border:1px solid #E2E8F0;">{capa_actions}</pre>
+  <pre style="background:#F8FAFC; color:#0F172A; border:1px solid #E2E8F0;">{e_capa}</pre>
 </body>
 </html>"""
-        return HTMLResponse(content=html_doc)
+        return HTMLResponse(
+            content=html_doc,
+            headers={
+                # Force download rather than inline render, and lock the document
+                # down with a restrictive CSP as defense-in-depth against XSS.
+                "Content-Disposition": f'attachment; filename="Sentinel-RCA-Incident-{inc_num}.html"',
+                "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src data:",
+            },
+        )
 
     # Markdown format default with full RCA
     md_content = f"""# 🛡️ Microsoft Sentinel SOC Root Cause Analysis (RCA) Report
