@@ -12,6 +12,32 @@ class RemediationService:
     Remediation engine for Microsoft Sentinel, Microsoft Entra ID, and Defender XDR.
     """
 
+    # Containment actions whose live integrations are NOT implemented yet. In
+    # live mode these must not claim success; in demo mode they are simulated and
+    # clearly labelled as such. Only `close_false_positive` performs real work.
+    _SIMULATED_ACTIONS = {
+        "isolate_endpoint": {
+            "description": "isolate endpoint '{entity}' from the network via Microsoft Defender for Endpoint",
+            "tags": ["Containment-DeviceIsolated", "Defender-Isolated"],
+        },
+        "revoke_sessions": {
+            "description": "revoke active Microsoft Entra ID sessions and refresh tokens for '{entity}'",
+            "tags": ["Containment-SessionsRevoked", "EntraID-Revoked"],
+        },
+        "block_ip": {
+            "description": "block IP '{entity}' at the perimeter firewall and Sentinel threat-intel feed",
+            "tags": ["Perimeter-Blocked", "IOC-Blacklisted"],
+        },
+        "disable_account": {
+            "description": "disable account '{entity}' in Microsoft Entra ID",
+            "tags": ["Account-Disabled", "Compromise-Contained"],
+        },
+        "trigger_playbook": {
+            "description": "trigger a Sentinel SOAR playbook for this incident",
+            "tags": ["Playbook-Triggered", "SOAR-Automated"],
+        },
+    }
+
     async def execute_remediation(
         self,
         incident_id: str,
@@ -22,55 +48,17 @@ class RemediationService:
     ) -> Dict[str, Any]:
         """
         Executes a targeted containment or remediation action and logs the audit trail into Sentinel.
+
+        Actions whose live Azure/Defender/Graph integrations are not implemented
+        return status SIMULATED (demo mode) or NOT_IMPLEMENTED (live mode); they
+        never report SUCCESS for an action that did not actually take effect.
         """
         parameters = parameters or {}
         timestamp = datetime.utcnow().isoformat() + "Z"
         logger.info(f"Executing remediation '{action_type}' for entity '{entity}' by {analyst_name}")
 
-        result_message = ""
-        action_status = "SUCCESS"
-        applied_tags = []
-
-        # 1. Device Network Isolation via Microsoft Defender for Endpoint
-        if action_type == "isolate_endpoint":
-            if not settings.DEMO_MODE:
-                # Live integration with Defender for Endpoint API (POST /api/machines/{id}/isolate)
-                pass
-            result_message = f"Endpoint device '{entity}' was successfully isolated from corporate network via Microsoft Defender for Endpoint. Forensic telemetry preservation enabled."
-            applied_tags = ["Containment-DeviceIsolated", "Defender-Isolated"]
-
-        # 2. Revoke Entra ID Active Sign-in Sessions & Invalidate Refresh Tokens
-        elif action_type == "revoke_sessions":
-            if not settings.DEMO_MODE:
-                # Live Microsoft Graph API (POST /v1.0/users/{id}/revokeSignInSessions)
-                pass
-            result_message = f"Active Microsoft Entra ID sessions and refresh tokens revoked for user '{entity}'. Next interactive authentication will enforce MFA & password reset."
-            applied_tags = ["Containment-SessionsRevoked", "EntraID-Revoked"]
-
-        # 3. Block Malicious IP at Perimeter (Azure Firewall / NSG / Sentinel Threat Intelligence)
-        elif action_type == "block_ip":
-            if not settings.DEMO_MODE:
-                # Live ARM / Sentinel ThreatIntelligenceIndicator indicator ingestion
-                pass
-            result_message = f"Malicious external IP '{entity}' added to Azure Perimeter Firewall ingress/egress drop rules and Sentinel Threat Intelligence feed (90-day TTL)."
-            applied_tags = ["Perimeter-Blocked", "IOC-Blacklisted"]
-
-        # 4. Disable Compromised Account in Microsoft Entra ID
-        elif action_type == "disable_account":
-            if not settings.DEMO_MODE:
-                # Live Microsoft Graph API (PATCH /v1.0/users/{id} -> accountEnabled: False)
-                pass
-            result_message = f"Compromised account '{entity}' was temporarily disabled in Microsoft Entra ID directory to prevent further lateral movement."
-            applied_tags = ["Account-Disabled", "Compromise-Contained"]
-
-        # 5. Trigger Sentinel SOAR Playbook (Azure Logic App)
-        elif action_type == "trigger_playbook":
-            playbook_name = parameters.get("playbook_name", "SOAR-Incident-Containment-Playbook")
-            result_message = f"Sentinel SOAR Automation Playbook '{playbook_name}' triggered for incident #{incident_id}. Automated ticketing, SOC Slack notification, and forensic snapshot initiated."
-            applied_tags = ["Playbook-Triggered", "SOAR-Automated"]
-
-        # 6. Auto-Close as False Positive
-        elif action_type == "close_false_positive":
+        # Real, implemented action: close the incident as a false positive.
+        if action_type == "close_false_positive":
             reason = parameters.get("reason", "Authorized Security Testing / Benign Scanner Noise")
             await sentinel_client.update_status(
                 incident_id=incident_id,
@@ -79,41 +67,80 @@ class RemediationService:
                 classification_reason=reason,
                 labels=["Closed-FalsePositive", "AI-Verified"]
             )
-            result_message = f"Incident #{incident_id} successfully closed in Microsoft Sentinel as False Positive. Reason: {reason}."
-            applied_tags = ["Closed-FalsePositive"]
-
-        else:
+            result_message = f"Incident #{incident_id} closed in Microsoft Sentinel as False Positive. Reason: {reason}."
+            await sentinel_client.add_comment(
+                incident_id,
+                f"### ⚡ Remediation Executed\n- **Action:** `close_false_positive`\n"
+                f"- **Executed By:** `{analyst_name}`\n- **Timestamp:** `{timestamp}`\n"
+                f"- **Result:** {result_message}",
+                author=analyst_name,
+            )
             return {
-                "status": "ERROR",
-                "message": f"Remediation action '{action_type}' is not supported."
+                "status": "SUCCESS",
+                "action_type": action_type,
+                "entity": entity,
+                "result_message": result_message,
+                "executed_by": analyst_name,
+                "timestamp": timestamp,
+                "applied_tags": ["Closed-FalsePositive"],
+                "simulated": False,
             }
 
-        # Automatically record audit trail comment into the Microsoft Sentinel incident
-        audit_comment = f"""### ⚡ Active Remediation Executed
-- **Action Type:** `{action_type}`
-- **Target Entity:** `{entity}`
-- **Executed By:** `{analyst_name}`
-- **Timestamp:** `{timestamp}`
-- **Result:** {result_message}
-"""
-        await sentinel_client.add_comment(incident_id, audit_comment, author=analyst_name)
+        spec = self._SIMULATED_ACTIONS.get(action_type)
+        if spec is None:
+            return {
+                "status": "ERROR",
+                "message": f"Remediation action '{action_type}' is not supported.",
+            }
 
-        # Update Incident Tags if applicable
-        if applied_tags:
-            incident = await sentinel_client.get_incident(incident_id)
-            if incident:
-                existing_labels = incident.get("labels", [])
-                new_labels = list(set(existing_labels + applied_tags))
-                await sentinel_client.update_status(incident_id=incident_id, status=incident.get("status", "Active"), labels=new_labels)
+        intent = spec["description"].format(entity=entity)
+
+        # Live mode: the integration does not exist, so do not pretend it ran and
+        # do not write a false containment record into the incident.
+        if not settings.DEMO_MODE:
+            result_message = (
+                f"NOT EXECUTED: the live integration to {intent} is not implemented in this build. "
+                f"No change was made. Perform this containment action manually in the relevant portal."
+            )
+            logger.warning(f"Remediation '{action_type}' requested in live mode but not implemented; no action taken.")
+            return {
+                "status": "NOT_IMPLEMENTED",
+                "action_type": action_type,
+                "entity": entity,
+                "result_message": result_message,
+                "executed_by": analyst_name,
+                "timestamp": timestamp,
+                "applied_tags": [],
+                "simulated": False,
+            }
+
+        # Demo mode: simulate and label the audit trail explicitly as a simulation.
+        result_message = f"[SIMULATION] Demo mode: would {intent}. No real change was made."
+        applied_tags = [f"SIMULATED-{t}" for t in spec["tags"]]
+        await sentinel_client.add_comment(
+            incident_id,
+            f"### 🧪 Simulated Remediation (Demo Mode)\n- **Action:** `{action_type}`\n"
+            f"- **Target Entity:** `{entity}`\n- **Executed By:** `{analyst_name}`\n"
+            f"- **Timestamp:** `{timestamp}`\n- **Result:** {result_message}",
+            author=analyst_name,
+        )
+        incident = await sentinel_client.get_incident(incident_id)
+        if incident:
+            existing_labels = incident.get("labels", [])
+            new_labels = list(set(existing_labels + applied_tags))
+            await sentinel_client.update_status(
+                incident_id=incident_id, status=incident.get("status", "Active"), labels=new_labels
+            )
 
         return {
-            "status": action_status,
+            "status": "SIMULATED",
             "action_type": action_type,
             "entity": entity,
             "result_message": result_message,
             "executed_by": analyst_name,
             "timestamp": timestamp,
-            "applied_tags": applied_tags
+            "applied_tags": applied_tags,
+            "simulated": True,
         }
 
 remediation_service = RemediationService()

@@ -771,19 +771,33 @@ export default function IncidentDetail({
             </p>
 
             {/* Execution Result Banner */}
-            {remediationResult && (
-              <div className={`p-3 rounded-xl border text-xs space-y-1 ${
-                remediationResult.status === 'SUCCESS'
-                  ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
-                  : 'bg-red-500/10 border-red-500/30 text-red-400'
-              }`}>
-                <div className="flex items-center space-x-2 font-bold">
-                  {remediationResult.status === 'SUCCESS' ? <CheckCircle2 className="w-4 h-4" /> : <AlertTriangle className="w-4 h-4" />}
-                  <span>{remediationResult.status === 'SUCCESS' ? 'Remediation Executed Successfully' : 'Execution Failed'}</span>
+            {remediationResult && (() => {
+              const status = remediationResult.status;
+              const isSuccess = status === 'SUCCESS';
+              const isSimulated = status === 'SIMULATED';
+              const isNotImplemented = status === 'NOT_IMPLEMENTED';
+              const styles = isSuccess
+                ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
+                : (isSimulated || isNotImplemented)
+                  ? 'bg-amber-500/10 border-amber-500/30 text-amber-400'
+                  : 'bg-red-500/10 border-red-500/30 text-red-400';
+              const heading = isSuccess
+                ? 'Remediation Executed Successfully'
+                : isSimulated
+                  ? 'Simulated (Demo Mode) — No Real Change Made'
+                  : isNotImplemented
+                    ? 'Not Executed — Live Integration Not Implemented'
+                    : 'Execution Failed';
+              return (
+                <div className={`p-3 rounded-xl border text-xs space-y-1 ${styles}`}>
+                  <div className="flex items-center space-x-2 font-bold">
+                    {isSuccess ? <CheckCircle2 className="w-4 h-4" /> : <AlertTriangle className="w-4 h-4" />}
+                    <span>{heading}</span>
+                  </div>
+                  <p className="text-[11px] leading-relaxed">{remediationResult.result_message}</p>
                 </div>
-                <p className="text-[11px] leading-relaxed">{remediationResult.result_message}</p>
-              </div>
-            )}
+              );
+            })()}
 
             <div className="flex items-center justify-end space-x-3 pt-2">
               <button
