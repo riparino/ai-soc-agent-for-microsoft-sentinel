@@ -123,6 +123,38 @@ AUTO_CLOSE_FALSE_POSITIVES=False
 
 ---
 
+## 🛰️ Multi-Workspace / Multi-Tenant (Azure Lighthouse Fleet)
+
+One running instance can manage **many Microsoft Sentinel workspaces across
+delegated customer tenants** (an Azure Lighthouse fleet). A single managing-tenant
+service principal reaches ARM + Log Analytics across every delegated subscription;
+the only per-workspace data needed is each customer's subscription / resource group
+/ workspace coordinates.
+
+Define the fleet with **either** an inline JSON array (`WORKSPACES_JSON`) **or** a
+JSON file (`WORKSPACES_CONFIG_PATH`, scales to ~hundreds of workspaces — see
+[`backend/workspaces.example.json`](backend/workspaces.example.json)). With neither
+set, the single `AZURE_*` workspace is used (fully backward compatible).
+
+```env
+# Point at a JSON file describing the delegated workspace fleet
+WORKSPACES_CONFIG_PATH="./workspaces.json"
+```
+
+* Incidents are **namespaced** (`<workspace_id>::<incident_guid>`) so every request
+  routes back to the owning workspace automatically.
+* The incident queue has a **workspace/tenant selector** (pick one, several, or
+  aggregate the whole fleet); stats include a per-workspace breakdown.
+* **⚠️ Microsoft Graph is NOT delegated by Azure Lighthouse.** Identity features
+  (user listing, session revoke, account disable) work for the managing tenant or
+  for delegated tenants that add a per-customer Graph app registration; otherwise
+  user listing falls back to SigninLogs telemetry and identity *write* actions are
+  clearly refused (`BLOCKED_GRAPH_SCOPE`).
+
+👉 Full details and the registry schema: [`backend/docs/MULTI_TENANT.md`](backend/docs/MULTI_TENANT.md).
+
+---
+
 ## 🏗️ System Architecture
 
 ```mermaid

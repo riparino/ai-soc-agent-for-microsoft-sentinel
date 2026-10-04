@@ -3,8 +3,15 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 from app.config import settings
 from app.services.sentinel_client import sentinel_client
+from app.services.workspace_registry import workspace_registry
 
 logger = logging.getLogger(__name__)
+
+# Remediation actions that require Microsoft Graph *write* access to the target
+# tenant's directory. Azure Lighthouse does NOT delegate Microsoft Graph, so these
+# are only available for workspaces whose graph_mode is managing-tenant or
+# delegated-app (a per-customer app registration). See docs/MULTI_TENANT.md.
+GRAPH_WRITE_ACTIONS = {"revoke_sessions", "disable_account"}
 
 class RemediationService:
     """
@@ -26,6 +33,46 @@ class RemediationService:
         parameters = parameters or {}
         timestamp = datetime.utcnow().isoformat() + "Z"
         logger.info(f"Executing remediation '{action_type}' for entity '{entity}' by {analyst_name}")
+
+        # Route to the workspace (and therefore tenant) the incident belongs to.
+        workspace, _ = workspace_registry.resolve_ref(incident_id)
+
+        # Graph-dependent identity actions cannot cross Azure Lighthouse. If the
+        # target workspace's tenant is not reachable via Graph from this instance,
+        # refuse clearly instead of pretending the action succeeded.
+        if action_type in GRAPH_WRITE_ACTIONS and not workspace.graph_write_capable:
+            logger.warning(
+                f"Blocking Graph identity action '{action_type}' for workspace "
+                f"'{workspace.id}' (graph_mode={workspace.graph_mode})."
+            )
+            message = (
+                f"Identity action '{action_type}' on '{entity}' could not be executed for workspace "
+                f"'{workspace.display_name}'. Microsoft Graph is not delegated by Azure Lighthouse, so "
+                f"this instance cannot act on the customer tenant's directory. Remediate in the customer "
+                f"tenant directly, or register a per-customer Graph app (graph_tenant_id / graph_client_id "
+                f"/ graph_client_secret) with admin consent for that tenant."
+            )
+            audit_comment = (
+                f"### ⚠️ Remediation Blocked — Graph Scope Limitation\n"
+                f"- **Action Type:** `{action_type}`\n"
+                f"- **Target Entity:** `{entity}`\n"
+                f"- **Workspace:** `{workspace.display_name}` (graph_mode: `{workspace.graph_mode}`)\n"
+                f"- **Reason:** {message}"
+            )
+            try:
+                await sentinel_client.add_comment(incident_id, audit_comment, author=analyst_name)
+            except Exception:
+                pass
+            return {
+                "status": "BLOCKED_GRAPH_SCOPE",
+                "action_type": action_type,
+                "entity": entity,
+                "workspace_id": workspace.id,
+                "graph_mode": workspace.graph_mode,
+                "result_message": message,
+                "executed_by": analyst_name,
+                "timestamp": timestamp,
+            }
 
         result_message = ""
         action_status = "SUCCESS"
@@ -110,6 +157,8 @@ class RemediationService:
             "status": action_status,
             "action_type": action_type,
             "entity": entity,
+            "workspace_id": workspace.id,
+            "workspace_name": workspace.display_name,
             "result_message": result_message,
             "executed_by": analyst_name,
             "timestamp": timestamp,

@@ -3,8 +3,19 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 from app.auth.jwt_handler import get_current_user, User
 from app.services.sentinel_client import sentinel_client
+from app.services.workspace_registry import workspace_registry
 
 router = APIRouter(prefix="/incidents", tags=["Sentinel Incidents"])
+
+
+@router.get("/workspaces")
+async def list_workspaces(current_user: User = Depends(get_current_user)):
+    """List the managed Microsoft Sentinel workspace fleet for the UI selector.
+
+    Returns secret-free workspace metadata (id, display name, coordinates, and the
+    per-workspace Microsoft Graph handling mode)."""
+    workspaces = [w.public_dict() for w in workspace_registry.list_workspaces()]
+    return {"workspaces": workspaces, "count": len(workspaces)}
 
 class CommentRequest(BaseModel):
     message: str
@@ -22,19 +33,23 @@ async def list_incidents(
     status: Optional[str] = Query(None, description="Filter by status (New, Active, Closed)"),
     severity: Optional[str] = Query(None, description="Filter by severity (High, Medium, Low, Informational)"),
     days: Optional[int] = Query(None, description="Lookback window in days (1, 7, 30, 90)"),
+    workspace: Optional[str] = Query(None, description="Workspace selector: a workspace id, comma-separated ids, or 'all' (default) to aggregate the whole fleet"),
     current_user: User = Depends(get_current_user)
 ):
-    """Retrieve list of Microsoft Sentinel incidents within specified lookback period"""
-    return await sentinel_client.list_incidents(filter_status=status, severity=severity, time_range_days=days)
+    """Retrieve Microsoft Sentinel incidents across one, several, or all managed workspaces"""
+    return await sentinel_client.list_incidents(
+        filter_status=status, severity=severity, time_range_days=days, workspace=workspace
+    )
 
 @router.get("/stats/summary")
 async def get_incident_stats(
     days: Optional[int] = Query(None, description="Lookback window in days (1, 7, 14, 30, 90)"),
+    workspace: Optional[str] = Query(None, description="Workspace selector: a workspace id, comma-separated ids, or 'all' (default)"),
     current_user: User = Depends(get_current_user)
 ):
     """Retrieve SOC triage metrics and incident statistics for specific lookback timeline"""
     from app.api.triage import TRIAGE_REPORTS_CACHE
-    incidents = await sentinel_client.list_incidents(time_range_days=days)
+    incidents = await sentinel_client.list_incidents(time_range_days=days, workspace=workspace)
     total = len(incidents)
     new_count = sum(1 for i in incidents if i.get("status") == "New")
     active_count = sum(1 for i in incidents if i.get("status") == "Active")
@@ -56,6 +71,18 @@ async def get_incident_stats(
 
     timeline_text = f"Last {days} Days" if days and days > 1 else ("Last 24 Hours" if days == 1 else "All Time")
 
+    # Per-workspace breakdown so an analyst can see fleet distribution at a glance.
+    per_workspace: Dict[str, Dict[str, Any]] = {}
+    for inc in incidents:
+        wid = inc.get("workspaceId", "unknown")
+        bucket = per_workspace.setdefault(wid, {
+            "workspace_id": wid,
+            "workspace_name": inc.get("workspaceName", wid),
+            "count": 0,
+        })
+        bucket["count"] += 1
+    selected_workspaces = workspace_registry.resolve_targets(workspace)
+
     return {
         "total_incidents": total,
         "new_incidents": new_count,
@@ -68,7 +95,10 @@ async def get_incident_stats(
         "avg_triage_time_seconds": 4.8 if triaged_count > 0 else 0.0,
         "fp_reduction_rate": fp_rate,
         "lookback_days": days or "all",
-        "timeline_label": timeline_text
+        "timeline_label": timeline_text,
+        "workspace_selector": workspace or "all",
+        "workspace_count": len(selected_workspaces),
+        "per_workspace": list(per_workspace.values())
     }
 
 @router.get("/{incident_id}")
@@ -149,10 +179,25 @@ class AssignRequest(BaseModel):
     user_upn: Optional[str] = None
 
 @router.get("/users/entra")
-async def get_entra_users(current_user: User = Depends(get_current_user)):
-    """Retrieve list of SOC Engineers and tenant users from Microsoft Entra ID (Azure AD)"""
-    users = await sentinel_client.get_entra_users()
-    return {"users": users, "count": len(users)}
+async def get_entra_users(
+    workspace: Optional[str] = Query(None, description="Workspace id whose tenant directory to query (defaults to the managing tenant)"),
+    current_user: User = Depends(get_current_user)
+):
+    """Retrieve SOC engineers / tenant users for a workspace's tenant.
+
+    Because Azure Lighthouse does not delegate Microsoft Graph, the result source
+    depends on the workspace's graph_mode (direct Graph for the managing tenant or
+    a per-customer app, else SigninLogs telemetry for delegated tenants)."""
+    ws = workspace_registry.get(workspace) if workspace else None
+    users = await sentinel_client.get_entra_users(workspace=ws)
+    resolved = ws or workspace_registry.managing_workspace() or workspace_registry.default()
+    return {
+        "users": users,
+        "count": len(users),
+        "workspace_id": resolved.id if resolved else None,
+        "graph_mode": resolved.graph_mode if resolved else None,
+        "graph_write_capable": resolved.graph_write_capable if resolved else False,
+    }
 
 @router.patch("/{incident_id}/assign")
 async def assign_incident_owner(

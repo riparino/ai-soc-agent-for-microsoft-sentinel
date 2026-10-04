@@ -70,65 +70,73 @@ export const authApi = {
 };
 
 export const incidentsApi = {
-  getIncidents: async (status, severity, days) => {
+  getWorkspaces: async () => {
+    const res = await api.get('/incidents/workspaces');
+    return res.data;
+  },
+  getIncidents: async (status, severity, days, workspace) => {
     const params = {};
     if (status && status !== 'All') params.status = status;
     if (severity && severity !== 'All') params.severity = severity;
     if (days && days !== 'All') params.days = days;
+    if (workspace && workspace !== 'All') params.workspace = workspace;
     const res = await api.get('/incidents', { params });
     return res.data;
   },
   getIncident: async (id) => {
-    const res = await api.get(`/incidents/${id}`);
+    const res = await api.get(`/incidents/${encodeURIComponent(id)}`);
     return res.data;
   },
-  getStats: async (days = null) => {
+  getStats: async (days = null, workspace = null) => {
     const params = {};
     if (days && days !== 'All') params.days = days;
+    if (workspace && workspace !== 'All') params.workspace = workspace;
     const res = await api.get('/incidents/stats/summary', { params });
     return res.data;
   },
   addComment: async (id, message) => {
-    const res = await api.post(`/incidents/${id}/comments`, { message });
+    const res = await api.post(`/incidents/${encodeURIComponent(id)}/comments`, { message });
     return res.data;
   },
   updateStatus: async (id, payload) => {
-    const res = await api.patch(`/incidents/${id}/status`, payload);
+    const res = await api.patch(`/incidents/${encodeURIComponent(id)}/status`, payload);
     return res.data;
   },
   executeRemediation: async (id, actionType, entity, parameters = {}) => {
-    const res = await api.post(`/incidents/${id}/remediate`, {
+    const res = await api.post(`/incidents/${encodeURIComponent(id)}/remediate`, {
       action_type: actionType,
       entity,
       parameters
     });
     return res.data;
   },
-  getEntraUsers: async () => {
-    const res = await api.get('/incidents/users/entra');
+  getEntraUsers: async (workspace = null) => {
+    const params = {};
+    if (workspace && workspace !== 'All') params.workspace = workspace;
+    const res = await api.get('/incidents/users/entra', { params });
     return res.data;
   },
   assignIncident: async (id, payload) => {
-    const res = await api.patch(`/incidents/${id}/assign`, payload);
+    const res = await api.patch(`/incidents/${encodeURIComponent(id)}/assign`, payload);
     return res.data;
   }
 };
 
 export const triageApi = {
   runTriage: async (id) => {
-    const res = await api.post(`/triage/${id}/run`);
+    const res = await api.post(`/triage/${encodeURIComponent(id)}/run`);
     return res.data;
   },
   getReport: async (id) => {
-    const res = await api.get(`/triage/${id}/report`);
+    const res = await api.get(`/triage/${encodeURIComponent(id)}/report`);
     return res.data;
   },
   updateReport: async (id, updatedReport) => {
-    const res = await api.put(`/triage/${id}/report`, updatedReport);
+    const res = await api.put(`/triage/${encodeURIComponent(id)}/report`, updatedReport);
     return res.data;
   },
   chat: async (id, message, chatHistory = []) => {
-    const res = await api.post(`/triage/${id}/chat`, {
+    const res = await api.post(`/triage/${encodeURIComponent(id)}/chat`, {
       message,
       chat_history: chatHistory
     });

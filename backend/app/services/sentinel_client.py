@@ -6,6 +6,7 @@ import httpx
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 from app.config import settings
+from app.services.workspace_registry import workspace_registry, WorkspaceConfig
 
 logger = logging.getLogger(__name__)
 
@@ -316,25 +317,30 @@ def extract_entities_from_text(text: str) -> List[Dict[str, Any]]:
     return extracted
 
 class SentinelClient:
+    """
+    Fleet-aware Microsoft Sentinel client.
+
+    A single home-tenant service principal (the managing-tenant credentials in
+    ``settings``) is shared across the whole fleet: under Azure Lighthouse the
+    same ARM and Log Analytics tokens reach every delegated customer
+    subscription. Per-request workspace context is passed explicitly as a
+    ``WorkspaceConfig`` (resolved from the incident ref namespace) rather than
+    mutated onto the global settings singleton.
+    """
+
     def __init__(self):
-        self.subscription_id = settings.AZURE_SUBSCRIPTION_ID
-        self.resource_group = settings.AZURE_RESOURCE_GROUP_NAME
-        self.workspace_name = settings.AZURE_WORKSPACE_NAME
         self.credential = None
         self.is_live = False
         self._init_client()
 
     def _init_client(self):
-        self.subscription_id = settings.AZURE_SUBSCRIPTION_ID
-        self.resource_group = settings.AZURE_RESOURCE_GROUP_NAME
-        self.workspace_name = settings.AZURE_WORKSPACE_NAME
-        
+        """(Re)build the shared home-tenant credential and live/demo state."""
         has_creds = bool(
             (settings.USE_MANAGED_IDENTITY) or
             (settings.AZURE_TENANT_ID and settings.AZURE_CLIENT_ID and settings.AZURE_CLIENT_SECRET)
         )
-        has_workspace = bool(self.subscription_id and self.resource_group and self.workspace_name)
-        self.is_live = bool(not settings.DEMO_MODE and has_creds and has_workspace)
+        self.is_live = bool(not settings.DEMO_MODE and has_creds)
+        self.credential = None
 
         if self.is_live:
             try:
@@ -349,19 +355,26 @@ class SentinelClient:
                     )
                 else:
                     self.credential = DefaultAzureCredential()
-                logger.info("Initialized Azure Sentinel REST / SDK Credential successfully.")
+                logger.info("Initialized shared (managing-tenant) Azure credential for the workspace fleet.")
             except Exception as e:
                 logger.warning(f"Could not initialize Azure credentials: {e}. Running in simulation/demo mode.")
                 self.is_live = False
+        # Refresh the workspace fleet in case configuration changed.
+        try:
+            workspace_registry.reload()
+        except Exception as e:
+            logger.debug(f"Workspace registry reload note: {e}")
 
     def _get_arm_token(self) -> Optional[str]:
+        """ARM bearer token from the managing tenant (Lighthouse-honored across
+        delegated subscriptions)."""
         if self.credential:
             try:
                 token_obj = self.credential.get_token("https://management.azure.com/.default")
                 return token_obj.token
             except Exception:
                 pass
-        # Direct OAuth2 REST token fallback
+        # Direct OAuth2 REST token fallback (managing tenant).
         if settings.AZURE_TENANT_ID and settings.AZURE_CLIENT_ID and settings.AZURE_CLIENT_SECRET:
             try:
                 token_url = f"https://login.microsoftonline.com/{settings.AZURE_TENANT_ID}/oauth2/v2.0/token"
@@ -379,26 +392,100 @@ class SentinelClient:
                 logger.error(f"Failed to obtain Azure ARM bearer token: {e}")
         return None
 
-    def _get_base_url(self) -> str:
-        return f"https://management.azure.com/subscriptions/{self.subscription_id}/resourceGroups/{self.resource_group}/providers/Microsoft.OperationalInsights/workspaces/{self.workspace_name}/providers/Microsoft.SecurityInsights"
+    def _get_base_url(self, workspace: WorkspaceConfig) -> str:
+        """ARM SecurityInsights base URL for an explicit workspace."""
+        return workspace.arm_base_url()
 
-    async def _fetch_incident_entities_and_comments(self, client: httpx.AsyncClient, incident_id: str, headers: dict) -> tuple:
+    async def resolve_workspace_guid(self, workspace: WorkspaceConfig) -> Optional[str]:
+        """Resolve (and cache) the Log Analytics customerId GUID for a workspace.
+
+        Works across delegated subscriptions using the shared managing-tenant ARM
+        token (Lighthouse-honored).
+        """
+        guid = workspace.workspace_guid
+        if guid and len(guid) > 30 and "-" in guid:
+            return guid
+        if not (self.is_live and workspace.has_arm_coordinates()):
+            return guid
+        token = self._get_arm_token()
+        if not token:
+            return guid
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(workspace.arm_workspace_url(), headers={"Authorization": f"Bearer {token}"})
+                if resp.status_code == 200:
+                    cust_id = resp.json().get("properties", {}).get("customerId")
+                    if cust_id:
+                        workspace.workspace_guid = cust_id
+                        logger.info(f"Resolved Log Analytics GUID for workspace '{workspace.id}': {cust_id}")
+                        return cust_id
+        except Exception as e:
+            logger.debug(f"Could not resolve workspace GUID for '{workspace.id}': {e}")
+        return workspace.workspace_guid
+
+    # ------------------------------------------------------------- namespacing
+    def _namespace(self, incident: Dict[str, Any], workspace: WorkspaceConfig) -> Dict[str, Any]:
+        """Stamp workspace routing metadata and namespace the incident id."""
+        raw_id = incident.get("id")
+        incident["rawId"] = raw_id
+        incident["id"] = workspace_registry.make_ref(workspace.id, str(raw_id))
+        incident["workspaceId"] = workspace.id
+        incident["workspaceName"] = workspace.display_name
+        incident["workspaceTenantId"] = workspace.tenant_id
+        return incident
+
+    def _mock_home_map(self) -> Dict[str, str]:
+        """Deterministically assign each mock incident to a workspace (round-robin
+        over the full fleet) so demo routing is stable and testable."""
+        order = [w.id for w in workspace_registry.list_workspaces()]
+        mapping: Dict[str, str] = {}
+        if not order:
+            return mapping
+        for i, inc in enumerate(MOCK_INCIDENTS):
+            mapping[inc["id"]] = order[i % len(order)]
+        return mapping
+
+    def _passes_filters(self, inc: Dict[str, Any], filter_status, severity, time_range_days) -> bool:
+        if filter_status and filter_status != "All" and inc.get("status", "").lower() != filter_status.lower():
+            return False
+        if severity and severity != "All" and inc.get("severity", "").lower() != severity.lower():
+            return False
+        if time_range_days and time_range_days > 0:
+            cutoff = datetime.utcnow() - timedelta(days=time_range_days)
+            try:
+                c_time = datetime.fromisoformat(inc.get("createdTimeUtc", "").replace("Z", "+00:00")).replace(tzinfo=None)
+                if c_time < cutoff:
+                    return False
+            except Exception:
+                return True
+        return True
+
+    def _sort_incidents(self, incidents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        def _key(inc):
+            try:
+                return datetime.fromisoformat(inc.get("createdTimeUtc", "").replace("Z", "+00:00")).replace(tzinfo=None)
+            except Exception:
+                return datetime.min
+        return sorted(incidents, key=_key, reverse=True)
+
+    # ------------------------------------------------------- entity enrichment
+    async def _fetch_incident_entities_and_comments(
+        self, client: httpx.AsyncClient, workspace: WorkspaceConfig, incident_id: str, headers: dict
+    ) -> tuple:
         """Fetch entities, comments, and correlated alerts for an incident concurrently"""
         entities = []
         comments = []
         alerts = []
+        base_url = self._get_base_url(workspace)
 
         try:
-            # 1. Fetch Entities endpoint
-            entities_url = f"{self._get_base_url()}/incidents/{incident_id}/entities?api-version=2023-11-01"
+            entities_url = f"{base_url}/incidents/{incident_id}/entities?api-version=2023-11-01"
             e_task = client.post(entities_url, headers=headers)
-            
-            # 2. Fetch Comments endpoint
-            comments_url = f"{self._get_base_url()}/incidents/{incident_id}/comments?api-version=2023-11-01"
+
+            comments_url = f"{base_url}/incidents/{incident_id}/comments?api-version=2023-11-01"
             c_task = client.get(comments_url, headers=headers)
 
-            # 3. Fetch Alerts endpoint
-            alerts_url = f"{self._get_base_url()}/incidents/{incident_id}/alerts?api-version=2023-11-01"
+            alerts_url = f"{base_url}/incidents/{incident_id}/alerts?api-version=2023-11-01"
             a_task = client.post(alerts_url, headers=headers)
 
             e_resp, c_resp, a_resp = await asyncio.gather(e_task, c_task, a_task, return_exceptions=True)
@@ -454,7 +541,6 @@ class SentinelClient:
                         "alertLink": a_props.get("alertLink", "")
                     })
 
-                    # Also extract any entities from the alert if incident entities were sparse
                     for raw_e in a_props.get("entities", []):
                         parsed_e = parse_sentinel_entity(raw_e)
                         if parsed_e and not any(ex.get("name") == parsed_e.get("name") for ex in entities):
@@ -464,177 +550,188 @@ class SentinelClient:
 
         return entities, comments, alerts
 
+    # --------------------------------------------------------------- listing
+    async def _list_live_for_workspace(
+        self,
+        client: httpx.AsyncClient,
+        workspace: WorkspaceConfig,
+        token: str,
+        filter_status: Optional[str],
+        severity: Optional[str],
+        time_range_days: Optional[int],
+    ) -> List[Dict[str, Any]]:
+        """Fetch & map incidents from a single live workspace (namespaced)."""
+        base_url = self._get_base_url(workspace)
+        url = f"{base_url}/incidents?api-version=2023-11-01&$orderby=properties/createdTimeUtc desc"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        resp = await client.get(url, headers=headers)
+        if resp.status_code != 200:
+            logger.error(f"Failed to query Sentinel API for workspace '{workspace.id}' (HTTP {resp.status_code}): {resp.text}")
+            return []
+
+        raw_incidents = resp.json().get("value", [])
+        mapped = []
+        for item in raw_incidents:
+            props = item.get("properties", {})
+            inc_id = item.get("name")
+            inc_num = props.get("incidentNumber", 0)
+            raw_labels = props.get("labels", [])
+            labels = [l.get("labelName", "") if isinstance(l, dict) else str(l) for l in raw_labels]
+            owner = props.get("owner", {})
+            mapped.append({
+                "id": inc_id,
+                "incidentNumber": inc_num,
+                "title": props.get("title", f"Incident #{inc_num}"),
+                "description": props.get("description", ""),
+                "severity": props.get("severity", "Medium"),
+                "status": props.get("status", "New"),
+                "createdTimeUtc": props.get("createdTimeUtc", datetime.utcnow().isoformat() + "Z"),
+                "lastModifiedTimeUtc": props.get("lastModifiedTimeUtc", props.get("createdTimeUtc")),
+                "tactics": props.get("tactics", []),
+                "techniques": [],
+                "assignedTo": owner.get("assignedTo", owner.get("userPrincipalName")),
+                "classification": props.get("classification"),
+                "classificationReason": props.get("classificationReason"),
+                "classificationComment": props.get("classificationComment"),
+                "alertsCount": props.get("relatedAnalyticRuleIds", []) and len(props.get("relatedAnalyticRuleIds", [])) or 1,
+                "entities": [],
+                "comments": [],
+                "labels": labels
+            })
+
+        results = [i for i in mapped if self._passes_filters(i, filter_status, severity, time_range_days)]
+
+        # Concurrently enrich the active set with the real entity graph & alerts.
+        enrichment_tasks = [
+            self._fetch_incident_entities_and_comments(client, workspace, inc["id"], headers)
+            for inc in results[:10]
+        ]
+        if enrichment_tasks:
+            enrichment_results = await asyncio.gather(*enrichment_tasks, return_exceptions=True)
+            for i, res in enumerate(enrichment_results):
+                if not isinstance(res, Exception):
+                    ents, comms, alrts = res
+                    if not ents:
+                        combined_txt = f"{results[i]['title']} {results[i]['description']}"
+                        ents = extract_entities_from_text(combined_txt)
+                        if results[i].get("assignedTo"):
+                            ents.append({"kind": "Account", "name": results[i]["assignedTo"], "upn": results[i]["assignedTo"]})
+                    results[i]["entities"] = ents
+                    results[i]["comments"] = comms
+                    results[i]["alerts"] = alrts
+
+        for inc in results:
+            if not inc.get("alerts"):
+                inc["alerts"] = [{
+                    "id": f"al-{str(inc.get('id', ''))[:8]}",
+                    "title": inc.get("title"),
+                    "description": inc.get("description") or "Analytic detection triggered in Microsoft Sentinel.",
+                    "severity": inc.get("severity", "Medium"),
+                    "vendor": "Microsoft Sentinel (Analytics Rule)",
+                    "product": "Microsoft Sentinel",
+                    "tactics": inc.get("tactics", []),
+                    "techniques": inc.get("techniques", []),
+                    "timeGenerated": inc.get("createdTimeUtc"),
+                    "alertLink": f"https://portal.azure.com/#blade/Microsoft_Azure_Security_Insights/IncidentOverviewBlade/id/{inc.get('id')}"
+                }]
+            self._namespace(inc, workspace)
+
+        logger.info(f"Fetched {len(results)} incidents from Sentinel workspace '{workspace.display_name}' ({workspace.id}).")
+        return results
+
+    def _mock_incidents_for(
+        self,
+        targets: List[WorkspaceConfig],
+        filter_status: Optional[str],
+        severity: Optional[str],
+        time_range_days: Optional[int],
+    ) -> List[Dict[str, Any]]:
+        """Return namespaced copies of mock incidents routed to the target workspaces."""
+        target_ids = {w.id for w in targets}
+        ws_by_id = {w.id: w for w in workspace_registry.list_workspaces()}
+        home_map = self._mock_home_map()
+        results = []
+        for inc in MOCK_INCIDENTS:
+            home_id = home_map.get(inc["id"])
+            if home_id not in target_ids:
+                continue
+            workspace = ws_by_id.get(home_id)
+            if not workspace:
+                continue
+            if not self._passes_filters(inc, filter_status, severity, time_range_days):
+                continue
+            results.append(self._namespace({**inc}, workspace))
+        return results
+
     async def list_incidents(
         self,
         filter_status: Optional[str] = None,
         severity: Optional[str] = None,
-        time_range_days: Optional[int] = None
+        time_range_days: Optional[int] = None,
+        workspace: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Fetch list of incidents from Sentinel ARM API or mock data"""
+        """List incidents across one, several, or all workspaces in the fleet.
+
+        ``workspace`` is a selector: ``None``/``"all"`` aggregates the whole fleet,
+        or a single id / comma-separated list of ids selects specific workspaces.
+        Every returned incident carries a namespaced ``id`` plus ``workspaceId`` /
+        ``workspaceName`` so it can be routed back to its origin workspace.
+        """
+        targets = workspace_registry.resolve_targets(workspace)
+
         if self.is_live:
             token = self._get_arm_token()
             if token:
+                results: List[Dict[str, Any]] = []
                 try:
-                    url = f"{self._get_base_url()}/incidents?api-version=2023-11-01&$orderby=properties/createdTimeUtc desc"
-                    headers = {
-                        "Authorization": f"Bearer {token}",
-                        "Content-Type": "application/json"
-                    }
-
                     async with httpx.AsyncClient(timeout=20.0) as client:
-                        resp = await client.get(url, headers=headers)
-                        if resp.status_code == 200:
-                            data = resp.json()
-                            raw_incidents = data.get("value", [])
-                            mapped = []
-
-                            # Process incident basics
-                            for item in raw_incidents:
-                                props = item.get("properties", {})
-                                inc_id = item.get("name") # GUID
-                                inc_num = props.get("incidentNumber", 0)
-                                title = props.get("title", f"Incident #{inc_num}")
-                                description = props.get("description", "")
-                                sev = props.get("severity", "Medium")
-                                stat = props.get("status", "New")
-                                created = props.get("createdTimeUtc", datetime.utcnow().isoformat() + "Z")
-                                modified = props.get("lastModifiedTimeUtc", created)
-                                tactics = props.get("tactics", [])
-                                
-                                raw_labels = props.get("labels", [])
-                                labels = [l.get("labelName", "") if isinstance(l, dict) else str(l) for l in raw_labels]
-                                owner = props.get("owner", {})
-
-                                mapped.append({
-                                    "id": inc_id,
-                                    "incidentNumber": inc_num,
-                                    "title": title,
-                                    "description": description,
-                                    "severity": sev,
-                                    "status": stat,
-                                    "createdTimeUtc": created,
-                                    "lastModifiedTimeUtc": modified,
-                                    "tactics": tactics,
-                                    "techniques": [],
-                                    "assignedTo": owner.get("assignedTo", owner.get("userPrincipalName")),
-                                    "classification": props.get("classification"),
-                                    "classificationReason": props.get("classificationReason"),
-                                    "classificationComment": props.get("classificationComment"),
-                                    "alertsCount": props.get("relatedAnalyticRuleIds", []) and len(props.get("relatedAnalyticRuleIds", [])) or 1,
-                                    "entities": [],
-                                    "comments": [],
-                                    "labels": labels
-                                })
-                            
-                            # Filter results by lookback and status first before detailed relation fetch
-                            results = mapped
-                            if filter_status and filter_status != "All":
-                                results = [i for i in results if i.get("status", "").lower() == filter_status.lower()]
-                            if severity and severity != "All":
-                                results = [i for i in results if i.get("severity", "").lower() == severity.lower()]
-                            if time_range_days and time_range_days > 0:
-                                cutoff = datetime.utcnow() - timedelta(days=time_range_days)
-                                filtered = []
-                                for inc in results:
-                                    try:
-                                        c_time = datetime.fromisoformat(inc.get("createdTimeUtc", "").replace("Z", "+00:00")).replace(tzinfo=None)
-                                        if c_time >= cutoff:
-                                            filtered.append(inc)
-                                    except Exception:
-                                        filtered.append(inc)
-                                results = filtered
-
-                            # Concurrently enrich top incidents with real entity graph & alerts
-                            enrichment_tasks = [
-                                self._fetch_incident_entities_and_comments(client, inc["id"], headers)
-                                for inc in results[:15] # enrich active set
-                            ]
-                            if enrichment_tasks:
-                                enrichment_results = await asyncio.gather(*enrichment_tasks, return_exceptions=True)
-                                for i, res in enumerate(enrichment_results):
-                                    if not isinstance(res, Exception):
-                                        ents, comms, alrts = res
-                                        # Fallback to regex extraction if ARM entity count is 0
-                                        if not ents:
-                                            combined_txt = f"{results[i]['title']} {results[i]['description']}"
-                                            ents = extract_entities_from_text(combined_txt)
-                                            if results[i].get("assignedTo"):
-                                                ents.append({
-                                                    "kind": "Account",
-                                                    "name": results[i]["assignedTo"],
-                                                    "upn": results[i]["assignedTo"]
-                                                })
-                                        results[i]["entities"] = ents
-                                        results[i]["comments"] = comms
-                                        results[i]["alerts"] = alrts
-
-                            # Ensure every incident in results has at least the primary correlated alert
-                            for inc in results:
-                                if not inc.get("alerts"):
-                                    inc["alerts"] = [{
-                                        "id": f"al-{str(inc.get('id', ''))[:8]}",
-                                        "title": inc.get("title"),
-                                        "description": inc.get("description") or "Analytic detection triggered in Microsoft Sentinel.",
-                                        "severity": inc.get("severity", "Medium"),
-                                        "vendor": "Microsoft Sentinel (Analytics Rule)",
-                                        "product": "Microsoft Sentinel",
-                                        "tactics": inc.get("tactics", []),
-                                        "techniques": inc.get("techniques", []),
-                                        "timeGenerated": inc.get("createdTimeUtc"),
-                                        "alertLink": f"https://portal.azure.com/#blade/Microsoft_Azure_Security_Insights/IncidentOverviewBlade/id/{inc.get('id')}"
-                                    }]
-
-                            logger.info(f"Successfully fetched {len(results)} live incidents with full asset entities from Microsoft Sentinel '{self.workspace_name}'.")
-                            return results
-                        else:
-                            logger.error(f"Failed to query Sentinel API (HTTP {resp.status_code}): {resp.text}")
+                        for ws in targets:
+                            if not ws.has_arm_coordinates():
+                                continue
+                            try:
+                                results.extend(
+                                    await self._list_live_for_workspace(
+                                        client, ws, token, filter_status, severity, time_range_days
+                                    )
+                                )
+                            except Exception as e:
+                                logger.error(f"Exception listing incidents for workspace '{ws.id}': {e}")
+                    return self._sort_incidents(results)
                 except Exception as e:
-                    logger.error(f"Exception during Sentinel incidents retrieval: {e}")
+                    logger.error(f"Exception during multi-workspace incident retrieval: {e}")
 
-        # Fallback to in-memory mock response with filtering
-        results = MOCK_INCIDENTS
-        if filter_status and filter_status != "All":
-            results = [inc for inc in results if inc.get("status", "").lower() == filter_status.lower()]
-        if severity and severity != "All":
-            results = [inc for inc in results if inc.get("severity", "").lower() == severity.lower()]
-        if time_range_days and time_range_days > 0:
-            cutoff = datetime.utcnow() - timedelta(days=time_range_days)
-            filtered = []
-            for inc in results:
-                try:
-                    c_time = datetime.fromisoformat(inc.get("createdTimeUtc", "").replace("Z", "+00:00")).replace(tzinfo=None)
-                    if c_time >= cutoff:
-                        filtered.append(inc)
-                except Exception:
-                    filtered.append(inc)
-            results = filtered
-        return results
+        # Demo / mock fallback.
+        return self._sort_incidents(self._mock_incidents_for(targets, filter_status, severity, time_range_days))
 
     async def get_incident(self, incident_id: str) -> Optional[Dict[str, Any]]:
-        """Fetch single incident details with full entity graph, alerts, and comments"""
-        if self.is_live:
+        """Fetch a single incident, routing to the workspace encoded in the ref."""
+        workspace, raw_id = workspace_registry.resolve_ref(incident_id)
+
+        if self.is_live and workspace.has_arm_coordinates():
             token = self._get_arm_token()
             if token:
                 try:
-                    url = f"{self._get_base_url()}/incidents/{incident_id}?api-version=2023-11-01"
+                    base_url = self._get_base_url(workspace)
+                    url = f"{base_url}/incidents/{raw_id}?api-version=2023-11-01"
                     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
                     async with httpx.AsyncClient(timeout=15.0) as client:
                         resp = await client.get(url, headers=headers)
                         if resp.status_code == 200:
                             item = resp.json()
                             props = item.get("properties", {})
-                            
-                            entities, comments, alerts = await self._fetch_incident_entities_and_comments(client, incident_id, headers)
 
-                            # Fallback to regex extraction from title and description if entities empty
+                            entities, comments, alerts = await self._fetch_incident_entities_and_comments(
+                                client, workspace, raw_id, headers
+                            )
+
                             if not entities:
                                 combined_txt = f"{props.get('title', '')} {props.get('description', '')}"
                                 entities = extract_entities_from_text(combined_txt)
 
-                            # Ensure at least primary alert exists if ARM alerts returned 0
                             if not alerts:
                                 alerts = [{
-                                    "id": f"al-{str(incident_id)[:8]}",
+                                    "id": f"al-{str(raw_id)[:8]}",
                                     "title": props.get("title", f"Sentinel Incident #{props.get('incidentNumber', '')}"),
                                     "description": props.get("description") or "Analytic detection triggered in Microsoft Sentinel.",
                                     "severity": props.get("severity", "Medium"),
@@ -643,24 +740,19 @@ class SentinelClient:
                                     "tactics": props.get("tactics", []),
                                     "techniques": [],
                                     "timeGenerated": props.get("createdTimeUtc"),
-                                    "alertLink": f"https://portal.azure.com/#blade/Microsoft_Azure_Security_Insights/IncidentOverviewBlade/id/{incident_id}"
+                                    "alertLink": f"https://portal.azure.com/#blade/Microsoft_Azure_Security_Insights/IncidentOverviewBlade/id/{raw_id}"
                                 }]
 
-                            # Owner account entity
                             owner = props.get("owner", {})
                             owner_upn = owner.get("userPrincipalName") or owner.get("email")
                             if owner_upn and not any(e.get("kind") == "Account" and e.get("upn") == owner_upn for e in entities):
-                                entities.append({
-                                    "kind": "Account",
-                                    "name": owner.get("assignedTo", owner_upn),
-                                    "upn": owner_upn
-                                })
+                                entities.append({"kind": "Account", "name": owner.get("assignedTo", owner_upn), "upn": owner_upn})
 
                             raw_labels = props.get("labels", [])
                             labels = [l.get("labelName", "") if isinstance(l, dict) else str(l) for l in raw_labels]
 
-                            return {
-                                "id": incident_id,
+                            incident = {
+                                "id": raw_id,
                                 "incidentNumber": props.get("incidentNumber", 0),
                                 "title": props.get("title", ""),
                                 "description": props.get("description", ""),
@@ -679,34 +771,38 @@ class SentinelClient:
                                 "alerts": alerts,
                                 "labels": labels
                             }
+                            return self._namespace(incident, workspace)
                 except Exception as e:
-                    logger.error(f"Error fetching live incident {incident_id}: {e}")
+                    logger.error(f"Error fetching live incident {raw_id} in workspace '{workspace.id}': {e}")
 
-        # Fallback to mock search
+        # Mock fallback.
         for inc in MOCK_INCIDENTS:
-            if inc["id"] == incident_id or str(inc.get("incidentNumber")) == incident_id:
-                return inc
+            if inc["id"] == raw_id or str(inc.get("incidentNumber")) == raw_id:
+                return self._namespace({**inc}, workspace)
         return None
 
     async def add_comment(self, incident_id: str, message: str, author: str = "AI Sentinel Triage Agent") -> Dict[str, Any]:
-        """Post investigation note / comment to Sentinel Incident"""
-        if self.is_live:
+        """Post an investigation note to the incident's origin workspace."""
+        workspace, raw_id = workspace_registry.resolve_ref(incident_id)
+
+        if self.is_live and workspace.has_arm_coordinates():
             token = self._get_arm_token()
             if token:
                 try:
                     comment_name = str(uuid.uuid4())
-                    url = f"{self._get_base_url()}/incidents/{incident_id}/comments/{comment_name}?api-version=2023-11-01"
+                    base_url = self._get_base_url(workspace)
+                    url = f"{base_url}/incidents/{raw_id}/comments/{comment_name}?api-version=2023-11-01"
                     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
                     payload = {"properties": {"message": message}}
                     async with httpx.AsyncClient(timeout=10.0) as client:
                         resp = await client.put(url, headers=headers, json=payload)
                         if resp.status_code in [200, 201]:
-                            logger.info(f"Comment successfully posted to live Microsoft Sentinel incident {incident_id}.")
+                            logger.info(f"Comment posted to incident {raw_id} in workspace '{workspace.id}'.")
                             return {"status": "SUCCESS", "comment": {"id": comment_name, "message": message, "author": author}}
                 except Exception as e:
-                    logger.error(f"Failed to post comment to live Sentinel incident {incident_id}: {e}")
+                    logger.error(f"Failed to post comment to incident {raw_id} in '{workspace.id}': {e}")
 
-        # In-memory mock fallback
+        # Mock fallback.
         comment_entry = {
             "id": f"c-{uuid.uuid4().hex[:6]}",
             "author": author,
@@ -714,7 +810,7 @@ class SentinelClient:
             "createdTimeUtc": datetime.utcnow().isoformat() + "Z"
         }
         for inc in MOCK_INCIDENTS:
-            if inc["id"] == incident_id or str(inc.get("incidentNumber")) == incident_id:
+            if inc["id"] == raw_id or str(inc.get("incidentNumber")) == raw_id:
                 inc.setdefault("comments", []).append(comment_entry)
                 inc["lastModifiedTimeUtc"] = datetime.utcnow().isoformat() + "Z"
                 return {"status": "SUCCESS", "comment": comment_entry}
@@ -731,24 +827,25 @@ class SentinelClient:
         labels: Optional[List[str]] = None,
         updated_by: str = "SOC Analyst"
     ) -> Dict[str, Any]:
-        """Update Sentinel incident status, severity, labels or classification in live Azure"""
-        if self.is_live:
+        """Update incident status/classification in the incident's origin workspace."""
+        workspace, raw_id = workspace_registry.resolve_ref(incident_id)
+
+        if self.is_live and workspace.has_arm_coordinates():
             token = self._get_arm_token()
             if token:
                 try:
-                    url = f"{self._get_base_url()}/incidents/{incident_id}?api-version=2023-11-01"
+                    base_url = self._get_base_url(workspace)
+                    url = f"{base_url}/incidents/{raw_id}?api-version=2023-11-01"
                     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-                    
+
                     async with httpx.AsyncClient(timeout=15.0) as client:
-                        # 1. Fetch current incident properties to preserve title, severity, owner, labels
                         r_get = await client.get(url, headers=headers)
                         if r_get.status_code == 200:
                             props = r_get.json().get("properties", {})
                             props["status"] = status
                             if severity:
                                 props["severity"] = severity
-                            
-                            # Sentinel ARM specification for Closed incidents
+
                             if status == "Closed":
                                 cls = classification or props.get("classification") or "Undetermined"
                                 props["classification"] = cls
@@ -762,7 +859,6 @@ class SentinelClient:
                                     props["classificationReason"] = classification_reason or "SuspiciousButExpected"
                                 props["classificationComment"] = classification_comment or "Closed via Microsoft Sentinel AI Triage Platform"
                             elif status in ["New", "Active"]:
-                                # Clear closing metadata when reopening
                                 props.pop("classification", None)
                                 props.pop("classificationReason", None)
                                 props.pop("classificationComment", None)
@@ -770,12 +866,9 @@ class SentinelClient:
                             if labels:
                                 props["labels"] = [{"labelName": l, "labelType": "User"} for l in labels]
 
-                            # 2. Put updated incident properties
                             resp = await client.put(url, headers=headers, json={"properties": props})
                             if resp.status_code in [200, 201]:
-                                logger.info(f"Updated live Microsoft Sentinel incident {incident_id} status to {status}.")
-                                
-                                # 3. Auto-post tracking comment with classification details
+                                logger.info(f"Updated incident {raw_id} in '{workspace.id}' status to {status}.")
                                 if status == "Closed":
                                     comment_text = (
                                         f"🔒 **Incident Closed by {updated_by}**\n"
@@ -787,16 +880,15 @@ class SentinelClient:
                                     comment_text = f"📌 **Status Changed to {status}**\nIncident status was changed to **{status}** by **{updated_by}**."
 
                                 await self.add_comment(incident_id, comment_text, author=updated_by)
-
                                 return {"status": "SUCCESS", "incident": resp.json()}
                             else:
-                                logger.error(f"Failed to update live Sentinel incident status (HTTP {resp.status_code}): {resp.text}")
+                                logger.error(f"Failed to update incident {raw_id} (HTTP {resp.status_code}): {resp.text}")
                 except Exception as e:
-                    logger.error(f"Error updating live Sentinel incident {incident_id}: {e}")
+                    logger.error(f"Error updating incident {raw_id} in '{workspace.id}': {e}")
 
-        # In-memory mock fallback
+        # Mock fallback.
         for inc in MOCK_INCIDENTS:
-            if inc["id"] == incident_id or str(inc.get("incidentNumber")) == incident_id:
+            if inc["id"] == raw_id or str(inc.get("incidentNumber")) == raw_id:
                 inc["status"] = status
                 if severity:
                     inc["severity"] = severity
@@ -813,67 +905,77 @@ class SentinelClient:
                     current_labels.update(labels)
                     inc["labels"] = list(current_labels)
                 inc["lastModifiedTimeUtc"] = datetime.utcnow().isoformat() + "Z"
-                return {"status": "SUCCESS", "incident": inc}
+                return {"status": "SUCCESS", "incident": self._namespace({**inc}, workspace)}
         return {"status": "NOT_FOUND", "message": f"Incident {incident_id} not found."}
 
-    async def get_entra_users(self) -> List[Dict[str, Any]]:
+    async def get_entra_users(self, workspace: Optional[WorkspaceConfig] = None) -> List[Dict[str, Any]]:
         """
-        Fetch list of SOC Engineers and tenant users from Microsoft Entra ID (Azure AD).
-        Tries Microsoft Graph API first, with seamless fallback to Sentinel Log Analytics
-        IdentityInfo / SigninLogs telemetry tables.
+        List SOC engineers / tenant users for a workspace.
+
+        Microsoft Graph is NOT delegated by Azure Lighthouse, so directory access
+        depends on the workspace's ``graph_mode``:
+
+          * ``delegated-app``   - use the per-customer app registration to read the
+            customer tenant's directory via Microsoft Graph.
+          * ``managing-tenant`` - use the shared home SP's Graph token (home tenant).
+          * ``log-analytics-only`` - Graph cannot see the customer tenant from this
+            instance, so users are derived from the workspace's own SigninLogs
+            telemetry (which IS reachable via Lighthouse). Identity *write*
+            remediation remains unavailable for this workspace.
         """
+        workspace = workspace or workspace_registry.managing_workspace() or workspace_registry.default()
         users_map: Dict[str, Dict[str, Any]] = {}
 
-        # 1. Try Microsoft Graph API if available
-        if self.is_live and self.credential:
+        if self.is_live and workspace:
+            graph_credential = None
+            graph_source = None
             try:
-                graph_token = self.credential.get_token("https://graph.microsoft.com/.default")
-                if graph_token and graph_token.token:
-                    headers = {"Authorization": f"Bearer {graph_token.token}", "Content-Type": "application/json"}
-                    async with httpx.AsyncClient(timeout=8.0) as client:
-                        resp = await client.get(
-                            "https://graph.microsoft.com/v1.0/users?$select=id,displayName,userPrincipalName,mail,jobTitle,department&$top=100&$orderby=displayName",
-                            headers=headers
-                        )
-                        if resp.status_code == 200:
-                            data = resp.json().get("value", [])
-                            for u in data:
-                                upn = u.get("userPrincipalName") or u.get("mail")
-                                if upn:
-                                    users_map[upn.lower()] = {
-                                        "objectId": u.get("id"),
-                                        "displayName": u.get("displayName") or upn.split("@")[0],
-                                        "userPrincipalName": upn,
-                                        "email": u.get("mail") or upn,
-                                        "jobTitle": u.get("jobTitle") or "SOC Analyst",
-                                        "source": "Microsoft Graph API"
-                                    }
-                            if users_map:
-                                logger.info(f"Fetched {len(users_map)} users directly from Microsoft Graph API.")
-                                return list(users_map.values())
-            except Exception as e:
-                logger.debug(f"Note querying Microsoft Graph API (falling back to Sentinel directory telemetry): {e}")
+                mode = workspace.graph_mode
+                if mode == "delegated-app":
+                    from azure.identity import ClientSecretCredential
+                    graph_credential = ClientSecretCredential(
+                        tenant_id=workspace.graph_tenant_id,
+                        client_id=workspace.graph_client_id,
+                        client_secret=workspace.graph_client_secret,
+                    )
+                    graph_source = f"Microsoft Graph (delegated app · {workspace.display_name})"
+                elif mode == "managing-tenant" and self.credential:
+                    graph_credential = self.credential
+                    graph_source = "Microsoft Graph API (managing tenant)"
 
-        # 2. Query Sentinel Log Analytics Directory Telemetry (SigninLogs / IdentityInfo)
-        if self.is_live and self.credential:
+                if graph_credential:
+                    graph_token = graph_credential.get_token("https://graph.microsoft.com/.default")
+                    if graph_token and graph_token.token:
+                        headers = {"Authorization": f"Bearer {graph_token.token}", "Content-Type": "application/json"}
+                        async with httpx.AsyncClient(timeout=8.0) as client:
+                            resp = await client.get(
+                                "https://graph.microsoft.com/v1.0/users?$select=id,displayName,userPrincipalName,mail,jobTitle,department&$top=100&$orderby=displayName",
+                                headers=headers
+                            )
+                            if resp.status_code == 200:
+                                for u in resp.json().get("value", []):
+                                    upn = u.get("userPrincipalName") or u.get("mail")
+                                    if upn:
+                                        users_map[upn.lower()] = {
+                                            "objectId": u.get("id"),
+                                            "displayName": u.get("displayName") or upn.split("@")[0],
+                                            "userPrincipalName": upn,
+                                            "email": u.get("mail") or upn,
+                                            "jobTitle": u.get("jobTitle") or "SOC Analyst",
+                                            "source": graph_source
+                                        }
+                                if users_map:
+                                    logger.info(f"Fetched {len(users_map)} users via {graph_source} for workspace '{workspace.id}'.")
+                                    return sorted(list(users_map.values()), key=lambda x: x.get("displayName", ""))
+            except Exception as e:
+                logger.debug(f"Graph lookup note for workspace '{workspace.id}' (falling back to telemetry): {e}")
+
+        # Log Analytics SigninLogs telemetry (Lighthouse-honored) - the directory
+        # fallback for delegated tenants where Graph is unavailable.
+        if self.is_live and workspace and self.credential:
             try:
                 ws_token = self.credential.get_token("https://api.loganalytics.io/.default")
-                ws_id = settings.AZURE_WORKSPACE_ID or self._workspace_guid
-                
-                # If workspace GUID not resolved yet, resolve from ARM
-                if not ws_id:
-                    arm_tok = self._get_arm_token()
-                    if arm_tok:
-                        rg = settings.AZURE_RESOURCE_GROUP_NAME
-                        sub = settings.AZURE_SUBSCRIPTION_ID
-                        ws_name = settings.AZURE_WORKSPACE_NAME
-                        meta_url = f"https://management.azure.com/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.OperationalInsights/workspaces/{ws_name}?api-version=2022-10-01"
-                        async with httpx.AsyncClient(timeout=8.0) as client:
-                            meta_r = await client.get(meta_url, headers={"Authorization": f"Bearer {arm_tok}"})
-                            if meta_r.status_code == 200:
-                                ws_id = meta_r.json().get("properties", {}).get("customerId")
-                                self._workspace_guid = ws_id
-
+                ws_id = await self.resolve_workspace_guid(workspace)
                 if ws_token and ws_id:
                     query = (
                         "SigninLogs "
@@ -895,7 +997,6 @@ class SentinelClient:
                                 name = str(row[1]).strip()
                                 obj_id = str(row[2]).strip() if len(row) > 2 else None
                                 if upn and name and upn.lower() not in users_map:
-                                    # Formulate realistic SOC role descriptor
                                     role_title = "SOC Security Engineer" if "admin" in upn.lower() or "admin" in name.lower() else "Security Analyst"
                                     users_map[upn.lower()] = {
                                         "objectId": obj_id,
@@ -903,17 +1004,16 @@ class SentinelClient:
                                         "userPrincipalName": upn,
                                         "email": upn,
                                         "jobTitle": role_title,
-                                        "source": "Microsoft Entra ID (Live Tenant)"
+                                        "source": f"SigninLogs telemetry · {workspace.display_name} (Lighthouse)"
                                     }
             except Exception as e:
-                logger.error(f"Error querying Entra ID users from Log Analytics: {e}")
+                logger.error(f"Error querying Entra ID users from Log Analytics for '{workspace.id}': {e}")
 
-        # If live users found, return sorted by display name
         if users_map:
-            logger.info(f"Retrieved {len(users_map)} Entra ID SOC engineers from tenant.")
+            logger.info(f"Retrieved {len(users_map)} directory users for workspace '{workspace.id if workspace else 'default'}'.")
             return sorted(list(users_map.values()), key=lambda x: x.get("displayName", ""))
 
-        # 3. Standard Fallback List of SOC Engineers
+        # Standard fallback list of SOC engineers (demo / unconfigured).
         fallback_users = [
             {"objectId": "23d99f38-0162-4ce5-b160-67e1d83ec97e", "displayName": "Ankush Chouhan", "userPrincipalName": "ankush@security.corp", "email": "ankush@security.corp", "jobTitle": "Lead SOC Engineer", "source": "Entra ID Directory"},
             {"objectId": "341c3e9b-7c8c-4fee-9388-94b38cdbe4d3", "displayName": "SOC Administrator", "userPrincipalName": "socadmin@security.corp", "email": "socadmin@security.corp", "jobTitle": "Principal Incident Responder", "source": "Entra ID Directory"},
@@ -936,12 +1036,10 @@ class SentinelClient:
         user_upn: Optional[str] = None,
         assigned_by: str = "SOC Analyst"
     ) -> Dict[str, Any]:
-        """
-        Assigns or unassigns Microsoft Sentinel incident to an Entra ID SOC Engineer.
-        Syncs owner object directly to live Azure Resource Manager Sentinel incident.
-        """
+        """Assign/unassign an incident in its origin workspace."""
+        workspace, raw_id = workspace_registry.resolve_ref(incident_id)
         is_unassigning = not bool(user_upn or user_name or user_id)
-        
+
         owner_obj = {
             "objectId": user_id or None,
             "email": user_email or user_upn or None,
@@ -949,30 +1047,26 @@ class SentinelClient:
             "userPrincipalName": user_upn if not is_unassigning else None
         }
 
-        if self.is_live:
+        if self.is_live and workspace.has_arm_coordinates():
             token = self._get_arm_token()
             if token:
                 try:
-                    url = f"{self._get_base_url()}/incidents/{incident_id}?api-version=2023-11-01"
+                    base_url = self._get_base_url(workspace)
+                    url = f"{base_url}/incidents/{raw_id}?api-version=2023-11-01"
                     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-                    
+
                     async with httpx.AsyncClient(timeout=15.0) as client:
-                        # 1. Fetch current incident properties to preserve title, severity, status
                         r_get = await client.get(url, headers=headers)
                         if r_get.status_code == 200:
                             props = r_get.json().get("properties", {})
                             props["owner"] = owner_obj
-                            
-                            # 2. Put updated incident with new owner
+
                             resp = await client.put(url, headers=headers, json={"properties": props})
                             if resp.status_code in [200, 201]:
                                 assign_desc = "unassigned" if is_unassigning else f"assigned to {user_name} ({user_upn})"
-                                logger.info(f"Incident {incident_id} successfully {assign_desc} in Microsoft Sentinel.")
-                                
-                                # 3. Auto-post audit tracking comment
+                                logger.info(f"Incident {raw_id} in '{workspace.id}' successfully {assign_desc}.")
                                 comment_text = f"👤 **Incident Assignment Update**\nIncident was {assign_desc} by **{assigned_by}** via Sentinel AI Platform."
                                 await self.add_comment(incident_id, comment_text, author=assigned_by)
-                                
                                 return {
                                     "status": "SUCCESS",
                                     "message": f"Incident successfully {assign_desc}.",
@@ -980,13 +1074,13 @@ class SentinelClient:
                                     "owner": owner_obj
                                 }
                             else:
-                                logger.error(f"Failed to assign Sentinel incident (HTTP {resp.status_code}): {resp.text}")
+                                logger.error(f"Failed to assign incident {raw_id} (HTTP {resp.status_code}): {resp.text}")
                 except Exception as e:
-                    logger.error(f"Error during incident assignment via ARM API: {e}")
+                    logger.error(f"Error during incident assignment via ARM API for '{workspace.id}': {e}")
 
-        # In-memory mock fallback
+        # Mock fallback.
         for inc in MOCK_INCIDENTS:
-            if inc["id"] == incident_id or str(inc.get("incidentNumber")) == incident_id:
+            if inc["id"] == raw_id or str(inc.get("incidentNumber")) == raw_id:
                 inc["assignedTo"] = user_name or user_upn if not is_unassigning else None
                 inc["lastModifiedTimeUtc"] = datetime.utcnow().isoformat() + "Z"
                 assign_desc = "unassigned" if is_unassigning else f"assigned to {user_name} ({user_upn})"

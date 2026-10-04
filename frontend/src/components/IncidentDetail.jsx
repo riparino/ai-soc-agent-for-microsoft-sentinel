@@ -75,13 +75,16 @@ export default function IncidentDetail({
     return () => window.removeEventListener('sentinel:timezone-changed', handleTzChange);
   }, []);
 
-  // Fetch Entra ID Users once
+  // Fetch Entra ID users scoped to the incident's workspace/tenant. Because Azure
+  // Lighthouse does not delegate Microsoft Graph, the backend returns users from
+  // Graph (managing tenant / per-customer app) or SigninLogs telemetry depending on
+  // the workspace's graph_mode.
   useEffect(() => {
     let isMounted = true;
     const fetchUsers = async () => {
       setLoadingUsers(true);
       try {
-        const res = await incidentsApi.getEntraUsers();
+        const res = await incidentsApi.getEntraUsers(incident?.workspaceId);
         if (isMounted && res?.users) {
           setEntraUsers(res.users);
         }
@@ -93,7 +96,7 @@ export default function IncidentDetail({
     };
     fetchUsers();
     return () => { isMounted = false; };
-  }, []);
+  }, [incident?.workspaceId]);
 
   // Active Remediation Modal State
   const [remediationModal, setRemediationModal] = useState(null); // { type, title, entity, description }
@@ -775,11 +778,19 @@ export default function IncidentDetail({
               <div className={`p-3 rounded-xl border text-xs space-y-1 ${
                 remediationResult.status === 'SUCCESS'
                   ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
+                  : remediationResult.status === 'BLOCKED_GRAPH_SCOPE'
+                  ? 'bg-amber-500/10 border-amber-500/30 text-amber-500 dark:text-amber-400'
                   : 'bg-red-500/10 border-red-500/30 text-red-400'
               }`}>
                 <div className="flex items-center space-x-2 font-bold">
                   {remediationResult.status === 'SUCCESS' ? <CheckCircle2 className="w-4 h-4" /> : <AlertTriangle className="w-4 h-4" />}
-                  <span>{remediationResult.status === 'SUCCESS' ? 'Remediation Executed Successfully' : 'Execution Failed'}</span>
+                  <span>
+                    {remediationResult.status === 'SUCCESS'
+                      ? 'Remediation Executed Successfully'
+                      : remediationResult.status === 'BLOCKED_GRAPH_SCOPE'
+                      ? 'Action Unavailable — Microsoft Graph Not Delegated (Azure Lighthouse)'
+                      : 'Execution Failed'}
+                  </span>
                 </div>
                 <p className="text-[11px] leading-relaxed">{remediationResult.result_message}</p>
               </div>

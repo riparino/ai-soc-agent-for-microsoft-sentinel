@@ -18,14 +18,32 @@ class Settings(BaseSettings):
     ADMIN_PASSWORD: Optional[str] = None
     
     # Azure Sentinel & Azure Resource Manager Config
+    # These are the *managing (home) tenant* service-principal credentials. Under
+    # Azure Lighthouse a single home-tenant SP can reach ARM + Log Analytics across
+    # every delegated customer subscription, so these credentials are shared by the
+    # whole workspace fleet. The per-workspace coordinates below describe only the
+    # single/default (managing-tenant) workspace; the multi-workspace fleet is
+    # defined via WORKSPACES_JSON / WORKSPACES_CONFIG_PATH (see workspace_registry).
     AZURE_TENANT_ID: Optional[str] = None
     AZURE_CLIENT_ID: Optional[str] = None
     AZURE_CLIENT_SECRET: Optional[str] = None
     AZURE_SUBSCRIPTION_ID: Optional[str] = None
     AZURE_RESOURCE_GROUP_NAME: Optional[str] = None
     AZURE_WORKSPACE_NAME: Optional[str] = None
-    AZURE_WORKSPACE_ID: Optional[str] = None # Log Analytics Workspace ID
+    AZURE_WORKSPACE_ID: Optional[str] = None # Log Analytics Workspace ID (customerId GUID)
     USE_MANAGED_IDENTITY: bool = False
+
+    # Multi-workspace / multi-tenant fleet registry (Azure Lighthouse).
+    # Provide the full fleet of delegated Microsoft Sentinel workspaces either as
+    # an inline JSON array (WORKSPACES_JSON) or a path to a JSON file
+    # (WORKSPACES_CONFIG_PATH). Each entry supports:
+    #   id, display_name, tenant_id, subscription_id, resource_group,
+    #   workspace_name, workspace_guid, is_managing_tenant,
+    #   graph_tenant_id, graph_client_id, graph_client_secret
+    # When neither is set the registry falls back to the single AZURE_* workspace
+    # above (or demo workspaces in DEMO_MODE).
+    WORKSPACES_JSON: Optional[str] = None
+    WORKSPACES_CONFIG_PATH: Optional[str] = None
     
     # Simulation / Demo Mode (allows running standalone without live Azure credentials)
     DEMO_MODE: bool = True

@@ -142,8 +142,13 @@ AGENT_TOOL_DEFINITIONS = [
     }
 ]
 
-async def execute_tool_call(tool_name: str, arguments_json: str) -> Dict[str, Any]:
-    """Execute the matching Python tool based on LLM function call"""
+async def execute_tool_call(tool_name: str, arguments_json: str, workspace=None) -> Dict[str, Any]:
+    """Execute the matching Python tool based on LLM function call.
+
+    ``workspace`` carries the per-incident workspace context so KQL hunts run
+    against the correct delegated Sentinel workspace. Sentinel comment/update
+    tools route via the namespaced incident id embedded in their arguments.
+    """
     try:
         args = json.loads(arguments_json) if isinstance(arguments_json, str) else arguments_json
     except Exception:
@@ -152,7 +157,7 @@ async def execute_tool_call(tool_name: str, arguments_json: str) -> Dict[str, An
     if tool_name == "run_kql_query":
         query = args.get("query", "")
         timespan = args.get("timespan_hours", 24)
-        return await kql_runner.execute_kql(query, timespan_hours=timespan)
+        return await kql_runner.execute_kql(query, timespan_hours=timespan, workspace=workspace)
 
     elif tool_name == "check_ip_reputation":
         ip = args.get("ip_address", "")

@@ -6,6 +6,7 @@ from app.config import settings
 from app.agent.prompts import SOC_TRIAGE_SYSTEM_PROMPT, SOC_CHAT_SYSTEM_PROMPT
 from app.agent.tools import execute_tool_call
 from app.services.sentinel_client import sentinel_client
+from app.services.workspace_registry import workspace_registry
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,13 @@ class SentinelTriageAgent:
         title = incident.get("title", "Untitled Incident")
         description = incident.get("description", "")
         entities = incident.get("entities", [])
+
+        # Resolve the workspace this incident belongs to so KQL hunts run against
+        # the correct delegated Sentinel workspace (not a global singleton).
+        if incident.get("workspaceId"):
+            workspace = workspace_registry.get(incident.get("workspaceId")) or workspace_registry.default()
+        else:
+            workspace, _ = workspace_registry.resolve_ref(incident_id)
         
         async def notify(event_type: str, message: str, details: Optional[Dict[str, Any]] = None):
             logger.info(f"[{incident_id}] [{event_type}] {message}")
@@ -104,7 +112,7 @@ class SentinelTriageAgent:
         if extracted_accounts or extracted_ips:
             kql_query = "SigninLogs | where TimeGenerated >= ago(24h) | summarize count(), make_set(IPAddress), make_set(Location) by UserPrincipalName"
             await notify("KQL_EXECUTION", f"Hunting in Log Analytics for SigninLogs baseline: {kql_query}", {"query": kql_query})
-            res = await execute_tool_call("run_kql_query", json.dumps({"query": kql_query, "timespan_hours": 24}))
+            res = await execute_tool_call("run_kql_query", json.dumps({"query": kql_query, "timespan_hours": 24}), workspace=workspace)
             executed_kql_queries.append(kql_query)
             kql_findings.append({"type": "SigninLogs", "results": res})
             await notify("KQL_RESULT", f"Log Analytics returned {res.get('row_count', 0)} rows from SigninLogs", res)
@@ -113,7 +121,7 @@ class SentinelTriageAgent:
         if extracted_hosts or extracted_processes:
             kql_query = "DeviceProcessEvents | where InitiatingProcessFileName =~ 'WINWORD.EXE' or FileName =~ 'powershell.exe' | take 5"
             await notify("KQL_EXECUTION", f"Hunting for suspicious parent-child process lineage: {kql_query}", {"query": kql_query})
-            res = await execute_tool_call("run_kql_query", json.dumps({"query": kql_query, "timespan_hours": 12}))
+            res = await execute_tool_call("run_kql_query", json.dumps({"query": kql_query, "timespan_hours": 12}), workspace=workspace)
             executed_kql_queries.append(kql_query)
             kql_findings.append({"type": "DeviceProcessEvents", "results": res})
             await notify("KQL_RESULT", f"Log Analytics returned {res.get('row_count', 0)} process events", res)

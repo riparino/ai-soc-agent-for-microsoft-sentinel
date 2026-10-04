@@ -3,48 +3,29 @@ import httpx
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 from app.config import settings
+from app.services.workspace_registry import workspace_registry, WorkspaceConfig
 
 logger = logging.getLogger(__name__)
 
 class KQLRunner:
+    """
+    Fleet-aware KQL execution against Azure Log Analytics.
+
+    The managing-tenant credential is shared: under Azure Lighthouse a single
+    LogsQueryClient / Log Analytics token can query every delegated workspace, so
+    the workspace GUID is supplied per call rather than baked into the client.
+    """
+
     def __init__(self):
-        self.workspace_id = settings.AZURE_WORKSPACE_ID
         self.client = None
         self._init_azure_client()
 
-    def _resolve_workspace_guid(self) -> Optional[str]:
-        """Auto-resolve Log Analytics Workspace GUID (customerId) from Azure ARM if only workspace name is available"""
-        if settings.AZURE_WORKSPACE_ID and len(settings.AZURE_WORKSPACE_ID) > 30 and '-' in settings.AZURE_WORKSPACE_ID:
-            return settings.AZURE_WORKSPACE_ID
-
-        if settings.AZURE_SUBSCRIPTION_ID and settings.AZURE_RESOURCE_GROUP_NAME and settings.AZURE_WORKSPACE_NAME:
-            try:
-                from app.services.sentinel_client import sentinel_client
-                token = sentinel_client._get_arm_token()
-                if token:
-                    url = f"https://management.azure.com/subscriptions/{settings.AZURE_SUBSCRIPTION_ID}/resourceGroups/{settings.AZURE_RESOURCE_GROUP_NAME}/providers/Microsoft.OperationalInsights/workspaces/{settings.AZURE_WORKSPACE_NAME}?api-version=2022-10-01"
-                    with httpx.Client(timeout=10.0) as client:
-                        resp = client.get(url, headers={"Authorization": f"Bearer {token}"})
-                        if resp.status_code == 200:
-                            cust_id = resp.json().get("properties", {}).get("customerId")
-                            if cust_id:
-                                logger.info(f"Resolved Log Analytics Workspace GUID for '{settings.AZURE_WORKSPACE_NAME}': {cust_id}")
-                                settings.AZURE_WORKSPACE_ID = cust_id
-                                return cust_id
-            except Exception as e:
-                logger.debug(f"Could not auto-resolve workspace GUID from ARM: {e}")
-
-        return settings.AZURE_WORKSPACE_ID or settings.AZURE_WORKSPACE_NAME
-
     def _init_azure_client(self):
-        resolved_ws_id = self._resolve_workspace_guid()
-        self.workspace_id = resolved_ws_id
-
         has_creds = bool(
             (settings.USE_MANAGED_IDENTITY) or
             (settings.AZURE_TENANT_ID and settings.AZURE_CLIENT_ID and settings.AZURE_CLIENT_SECRET)
         )
-        if not settings.DEMO_MODE and self.workspace_id and has_creds:
+        if not settings.DEMO_MODE and has_creds:
             try:
                 from azure.identity import DefaultAzureCredential, ClientSecretCredential
                 from azure.monitor.query import LogsQueryClient
@@ -61,33 +42,55 @@ class KQLRunner:
                     credential = DefaultAzureCredential()
 
                 self.client = LogsQueryClient(credential)
-                logger.info(f"Initialized Azure Monitor LogsQueryClient successfully for Workspace GUID {self.workspace_id}.")
+                logger.info("Initialized shared Azure Monitor LogsQueryClient for the workspace fleet.")
             except Exception as e:
                 logger.warning(f"Failed to initialize Azure Monitor client (fallback to simulation): {e}")
                 self.client = None
         else:
             self.client = None
 
-    async def execute_kql(self, query: str, timespan_hours: int = 24) -> Dict[str, Any]:
-        """Execute a KQL query against Azure Log Analytics or generate simulated SOC log results"""
-        logger.info(f"Executing KQL query (timespan {timespan_hours}h): {query[:100]}...")
+    async def _resolve_workspace(self, workspace: Optional[WorkspaceConfig]) -> Optional[WorkspaceConfig]:
+        """Resolve the target workspace and ensure its Log Analytics GUID is known."""
+        workspace = workspace or workspace_registry.default()
+        if workspace and not (workspace.workspace_guid and "-" in str(workspace.workspace_guid)):
+            try:
+                from app.services.sentinel_client import sentinel_client
+                await sentinel_client.resolve_workspace_guid(workspace)
+            except Exception as e:
+                logger.debug(f"Could not resolve workspace GUID in KQL runner: {e}")
+        return workspace
 
-        # Ensure live client is initialized with valid Workspace GUID
-        if not self.client or not self.workspace_id or ('-' not in str(self.workspace_id)):
+    async def execute_kql(
+        self,
+        query: str,
+        timespan_hours: int = 24,
+        workspace: Optional[WorkspaceConfig] = None,
+    ) -> Dict[str, Any]:
+        """Execute a KQL query against a specific workspace's Log Analytics, or
+        generate simulated SOC log results in demo mode."""
+        workspace = await self._resolve_workspace(workspace)
+        workspace_guid = workspace.workspace_guid if workspace else None
+        workspace_name = workspace.workspace_name if workspace else None
+        logger.info(
+            f"Executing KQL (timespan {timespan_hours}h) on workspace "
+            f"'{workspace.id if workspace else 'default'}': {query[:100]}..."
+        )
+
+        if not self.client:
             self._init_azure_client()
 
-        # If live Azure client is active
-        if self.client and self.workspace_id and not settings.DEMO_MODE:
+        # Live Azure client path.
+        if self.client and workspace_guid and ("-" in str(workspace_guid)) and not settings.DEMO_MODE:
             try:
                 timespan = timedelta(hours=timespan_hours)
                 start_time = datetime.utcnow()
                 response = self.client.query_workspace(
-                    workspace_id=self.workspace_id,
+                    workspace_id=workspace_guid,
                     query=query,
                     timespan=timespan
                 )
                 latency_ms = int((datetime.utcnow() - start_time).total_seconds() * 1000)
-                
+
                 tables = []
                 for table in response.tables:
                     columns = [col.name if hasattr(col, "name") else str(col) for col in table.columns]
@@ -95,7 +98,6 @@ class KQLRunner:
                     for row in table.rows:
                         row_dict = {}
                         for col_name, val in zip(columns, row):
-                            # Convert datetime or non-serializable objects
                             if hasattr(val, "isoformat"):
                                 row_dict[col_name] = val.isoformat() + "Z"
                             elif isinstance(val, (dict, list, str, int, float, bool)) or val is None:
@@ -104,14 +106,14 @@ class KQLRunner:
                                 row_dict[col_name] = str(val)
                         rows.append(row_dict)
                     tables.append({"name": getattr(table, "name", "PrimaryResult"), "columns": columns, "rows": rows, "count": len(rows)})
-                
+
                 total_rows = sum(t["count"] for t in tables)
-                logger.info(f"KQL Query executed successfully in {latency_ms}ms, returned {total_rows} rows.")
+                logger.info(f"KQL executed in {latency_ms}ms on '{workspace.id}', returned {total_rows} rows.")
                 return {
                     "status": "SUCCESS",
                     "source": "AZURE_LOG_ANALYTICS (LIVE)",
-                    "workspace_id": self.workspace_id,
-                    "workspace_name": settings.AZURE_WORKSPACE_NAME,
+                    "workspace_id": workspace_guid,
+                    "workspace_name": workspace_name,
                     "query": query,
                     "latency_ms": latency_ms,
                     "tables": tables,
@@ -119,12 +121,17 @@ class KQLRunner:
                 }
             except Exception as e:
                 logger.warning(f"LogsQueryClient query error: {e}. Attempting direct ARM REST Query API...")
-                # Direct ARM Log Analytics REST Query fallback
+                # Direct ARM Log Analytics REST Query fallback (Lighthouse-honored).
                 try:
                     from app.services.sentinel_client import sentinel_client
                     arm_token = sentinel_client._get_arm_token()
-                    if arm_token and settings.AZURE_SUBSCRIPTION_ID and settings.AZURE_RESOURCE_GROUP_NAME and settings.AZURE_WORKSPACE_NAME:
-                        arm_url = f"https://management.azure.com/subscriptions/{settings.AZURE_SUBSCRIPTION_ID}/resourceGroups/{settings.AZURE_RESOURCE_GROUP_NAME}/providers/Microsoft.OperationalInsights/workspaces/{settings.AZURE_WORKSPACE_NAME}/api/query?api-version=2020-08-01"
+                    if arm_token and workspace and workspace.has_arm_coordinates():
+                        arm_url = (
+                            f"https://management.azure.com/subscriptions/{workspace.subscription_id}"
+                            f"/resourceGroups/{workspace.resource_group}"
+                            f"/providers/Microsoft.OperationalInsights/workspaces/{workspace.workspace_name}"
+                            f"/api/query?api-version=2020-08-01"
+                        )
                         start_time = datetime.utcnow()
                         async with httpx.AsyncClient(timeout=25.0) as http_c:
                             arm_resp = await http_c.post(
@@ -137,17 +144,15 @@ class KQLRunner:
                                 tables = []
                                 for t in raw_tables:
                                     col_names = [c.get("name", str(c)) for c in t.get("columns", [])]
-                                    t_rows = []
-                                    for r in t.get("rows", []):
-                                        t_rows.append(dict(zip(col_names, r)))
+                                    t_rows = [dict(zip(col_names, r)) for r in t.get("rows", [])]
                                     tables.append({"name": t.get("name", "PrimaryResult"), "columns": col_names, "rows": t_rows, "count": len(t_rows)})
                                 latency_ms = int((datetime.utcnow() - start_time).total_seconds() * 1000)
                                 total_rows = sum(t["count"] for t in tables)
-                                logger.info(f"ARM KQL Query executed in {latency_ms}ms, returned {total_rows} rows.")
+                                logger.info(f"ARM KQL executed in {latency_ms}ms on '{workspace.id}', returned {total_rows} rows.")
                                 return {
                                     "status": "SUCCESS",
                                     "source": "AZURE_LOG_ANALYTICS (ARM REST)",
-                                    "workspace_name": settings.AZURE_WORKSPACE_NAME,
+                                    "workspace_name": workspace_name,
                                     "query": query,
                                     "latency_ms": latency_ms,
                                     "tables": tables,
@@ -158,7 +163,7 @@ class KQLRunner:
 
                 logger.warning(f"Live Log Analytics execution unavailable ({e}). Falling back to simulation engine.")
 
-        # Simulated KQL execution based on query patterns
+        # Simulated KQL execution based on query patterns.
         query_lower = query.lower()
         rows = []
         columns = []
@@ -260,6 +265,7 @@ class KQLRunner:
         return {
             "status": "SUCCESS",
             "source": "SIMULATED_LOG_ANALYTICS (DEMO)",
+            "workspace_name": workspace_name,
             "query": query,
             "timespan_hours": timespan_hours,
             "tables": [
