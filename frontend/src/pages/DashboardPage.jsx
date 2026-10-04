@@ -92,9 +92,12 @@ export default function DashboardPage() {
     setWorkbenchTab('trace');
     setStreamEvents([]);
 
-    // Open WebSocket for live telemetry streaming
+    // Open WebSocket for live telemetry streaming. The backend authenticates the
+    // handshake, so the JWT is passed as a query parameter (a WebSocket cannot
+    // carry an Authorization header from the browser).
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws/triage/${incident.id}`;
+    const token = localStorage.getItem('sentinel_token');
+    const wsUrl = `${protocol}//${window.location.host}/ws/triage/${incident.id}?token=${encodeURIComponent(token || '')}`;
     const ws = new WebSocket(wsUrl);
 
     ws.onmessage = (event) => {

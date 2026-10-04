@@ -122,24 +122,36 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
     return encoded_jwt
 
-async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
+def resolve_user_from_token(token: Optional[str]) -> Optional[User]:
+    """Validate a JWT and return the backing user, or None if invalid.
+
+    The role is always sourced from the authoritative user store, never from the
+    token's own claims, so a token cannot assert a privilege its account lacks.
+    Tokens whose subject is unknown or disabled are rejected rather than being
+    turned into a fabricated user.
+    """
+    if not token:
+        return None
     try:
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        username: str = payload.get("sub")
-        role: str = payload.get("role", "analyst")
-        if username is None:
-            raise credentials_exception
-        token_data = TokenData(username=username, role=role)
     except JWTError:
-        raise credentials_exception
-        
-    user_dict = USERS_DB.get(token_data.username)
-    if user_dict is None:
-        # Support fallback user for dynamic login if authenticated via external SSO
-        return User(username=token_data.username, email=f"{token_data.username}@corp.local", role=token_data.role, full_name=token_data.username)
+        return None
+
+    username = payload.get("sub")
+    if not username:
+        return None
+
+    user_dict = USERS_DB.get(username)
+    if user_dict is None or user_dict.get("disabled", False):
+        return None
     return User(**user_dict)
+
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
+    user = resolve_user_from_token(token)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user

@@ -12,7 +12,11 @@ services:
       - APP_ENV=production
       - DEMO_MODE=true
       - ADMIN_USERNAME=soc_admin
-      - SECRET_KEY=sentinel-super-secret-key-change-in-production-2026
+      # SECRET_KEY is intentionally not set here. In DEMO_MODE the app generates
+      # an ephemeral key at startup. For any non-demo run, supply a strong unique
+      # key via an env file or secret store, e.g.:
+      #   SECRET_KEY=$(python -c "import secrets; print(secrets.token_urlsafe(64))")
+      # - SECRET_KEY=<set-a-strong-unique-value-outside-version-control>
       # Azure Sentinel Configuration (Uncomment and fill when live)
       # - AZURE_TENANT_ID=your-tenant-id
       # - AZURE_CLIENT_ID=your-client-id

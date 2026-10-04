@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse
 
 from contextlib import asynccontextmanager
 from app.config import settings
-from app.auth.jwt_handler import init_default_users
+from app.auth.jwt_handler import init_default_users, resolve_user_from_token
 from app.auth.routes import router as auth_router
 from app.api.incidents import router as incidents_router
 from app.api.triage import router as triage_router, TRIAGE_REPORTS_CACHE
@@ -62,8 +62,19 @@ async def readyz():
 # Real-time WebSocket Stream for Live Investigation Trails
 @app.websocket("/ws/triage/{incident_id}")
 async def websocket_triage_stream(websocket: WebSocket, incident_id: str):
+    # Authenticate before accepting. Browsers cannot set an Authorization header
+    # on a WebSocket, so the JWT is passed as the `token` query parameter. Reject
+    # unauthenticated connections so an anonymous caller cannot trigger triage
+    # runs (LLM spend, live KQL, comments written back to Sentinel).
+    token = websocket.query_params.get("token")
+    user = resolve_user_from_token(token)
+    if user is None:
+        await websocket.close(code=1008)  # policy violation
+        logger.warning(f"Rejected unauthenticated WebSocket triage connection for {incident_id}")
+        return
+
     await websocket.accept()
-    logger.info(f"WebSocket connected for incident triage stream: {incident_id}")
+    logger.info(f"WebSocket connected for incident triage stream {incident_id} (user: {user.username})")
     
     try:
         # Check if incident exists
