@@ -1,9 +1,36 @@
-import httpx
+import ipaddress
 import logging
+import re
+import httpx
 from typing import Dict, Any
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Indicators are interpolated into KQL, so they are strictly validated first.
+# Accept only IPv4/IPv6 literals, hex file hashes (MD5/SHA1/SHA256), and simple
+# hostnames/domains. Anything else is rejected rather than interpolated.
+_HASH_RE = re.compile(r"^[A-Fa-f0-9]{32,64}$")
+_DOMAIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$")
+
+
+def _is_private_ip(addr: str) -> bool:
+    """True for RFC1918 / loopback / link-local addresses via real CIDR membership."""
+    try:
+        return ipaddress.ip_address(addr).is_private
+    except ValueError:
+        return False
+
+
+def _is_valid_indicator(indicator: str) -> bool:
+    if not indicator or len(indicator) > 253:
+        return False
+    try:
+        ipaddress.ip_address(indicator)
+        return True
+    except ValueError:
+        pass
+    return bool(_HASH_RE.match(indicator) or _DOMAIN_RE.match(indicator))
 
 class ThreatIntelService:
     def __init__(self):
@@ -14,8 +41,11 @@ class ThreatIntelService:
 
     async def lookup_ip_reputation(self, ip_address: str) -> Dict[str, Any]:
         """Lookup IP reputation using AbuseIPDB with fallback to simulated intelligence"""
-        # Exclude private IP ranges from external reputation checks
-        if ip_address.startswith(("10.", "192.168.", "172.16.", "172.17.", "172.18.", "172.19.", "172.2", "172.3", "127.")):
+        # Exclude private IP ranges from external reputation checks. Use real CIDR
+        # membership: the old string-prefix test matched public ranges like
+        # 172.2x/172.3x (e.g. Google's 172.217.x.x) and wrongly treated malicious
+        # public IPs as benign internal.
+        if _is_private_ip(ip_address):
             return {
                 "ip": ip_address,
                 "is_private": True,
@@ -151,13 +181,28 @@ class ThreatIntelService:
         if not self.microsoft_ti_enabled:
             return {"status": "DISABLED", "message": "Microsoft Threat Intelligence integration is disabled."}
 
+        # Reject anything that is not a well-formed IP / hash / domain before it
+        # reaches a KQL string (prevents KQL injection via a crafted indicator,
+        # e.g. from indirect prompt injection in incident text).
+        if not _is_valid_indicator(indicator):
+            logger.warning(f"Rejected malformed threat-intel indicator: {indicator!r}")
+            return {
+                "source": "Microsoft Defender Threat Intelligence (MDTI)",
+                "indicator": indicator,
+                "type": indicator_type,
+                "verdict": "INVALID_INDICATOR",
+                "threat_type": "Rejected: indicator is not a valid IP, hash, or domain.",
+                "confidence_score": 0,
+            }
+
         # Query Log Analytics ThreatIntelligenceIndicator table if available
         try:
             from app.services.kql_runner import kql_runner
             kql_query = f"ThreatIntelligenceIndicator | where NetworkIP == '{indicator}' or FileHashValue == '{indicator}' or DomainName == '{indicator}' | order by TimeGenerated desc | take 1"
             kql_res = await kql_runner.execute_kql(kql_query, timespan_hours=720)
             if kql_res.get("row_count", 0) > 0:
-                row = kql_res["rows"][0]
+                # Rows live under tables[0].rows, not a top-level "rows" key.
+                row = kql_res["tables"][0]["rows"][0]
                 return {
                     "source": "Microsoft Sentinel ThreatIntelligenceIndicator",
                     "indicator": indicator,

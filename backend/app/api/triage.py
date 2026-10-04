@@ -27,11 +27,26 @@ async def execute_kql_query(
     req: KQLRunRequest,
     current_user: User = Depends(get_current_user)
 ):
-    """Execute arbitrary KQL query directly against Log Analytics workspace"""
+    """Execute a KQL query directly against the Log Analytics workspace.
+
+    Note: this runs with the workspace service principal's permissions. The
+    timespan is capped and every call is audit-logged with the caller. A
+    table/operator allow-list should still be added before exposing this beyond
+    trusted analysts.
+    """
+    import logging
     from app.services.kql_runner import kql_runner
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
-    result = await kql_runner.execute_kql(req.query, timespan_hours=req.timespan_hours or 24)
+
+    # Cap the lookback window (max 30 days) to bound query cost/scope.
+    timespan = req.timespan_hours or 24
+    timespan = max(1, min(timespan, 720))
+
+    logging.getLogger("sentinel_soc_agent.audit").info(
+        f"KQL run by {current_user.username} ({current_user.role}); timespan={timespan}h; query={req.query[:500]}"
+    )
+    result = await kql_runner.execute_kql(req.query, timespan_hours=timespan)
     return result
 
 @router.post("/{incident_id}/run")

@@ -170,7 +170,7 @@ flowchart TD
   - Mandatory Close & Classify modal with dynamic reasons and closing audit notes.
 - **Production AKS & Cloud Ready**:
   - Includes enterprise Kubernetes manifests (`aks/`) with non-root security context.
-  - **CycloneDX v1.5 SBOM & 0 CVEs Verified**: Complete Software Bill of Materials provided in [`SBOM.md`](SBOM.md) and [`sbom-cyclonedx.json`](sbom-cyclonedx.json) (audited clean via Grype vulnerability scanning).
+  - **CycloneDX v1.5 SBOM (manually maintained)**: A Software Bill of Materials is provided in [`SBOM.md`](SBOM.md) and [`sbom-cyclonedx.json`](sbom-cyclonedx.json). Note: it is a hand-maintained inventory and is not yet generated from the built artifact or scanned in CI, so it may lag the resolved dependency set. Generate it from the image (e.g. `syft`) and scan with `grype`/`pip-audit` before relying on it for compliance.
 
 ---
 

@@ -25,3 +25,8 @@ frontend/.vite/
 Thumbs.db
 .idea/
 .vscode/
+
+# Kubernetes secret manifests with real values must never be committed.
+# Copy aks/secret.example.yaml to aks/secret.yaml and fill it in locally,
+# or source secrets from Azure Key Vault (CSI driver / External Secrets).
+aks/secret.yaml

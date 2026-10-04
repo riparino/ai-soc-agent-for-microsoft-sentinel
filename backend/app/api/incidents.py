@@ -44,15 +44,17 @@ async def get_incident_stats(
     med_count = sum(1 for i in incidents if i.get("severity") == "Medium")
     low_count = sum(1 for i in incidents if i.get("severity") in ["Low", "Informational"])
     
-    # Calculate live triaged counts from cached reports and Sentinel labels
+    # Triaged counts are derived only from real signals: reports actually held
+    # in the cache and incidents carrying an AI-Triaged label. No synthetic floor.
     incident_ids = {i.get("id") for i in incidents}
     cached_triaged = sum(1 for inc_id in TRIAGE_REPORTS_CACHE if inc_id in incident_ids)
     labeled_triaged = sum(1 for i in incidents if any("AI-Triaged" in label for label in i.get("labels", [])))
-    triaged_count = max(cached_triaged, labeled_triaged, 3 if total >= 3 else total)
+    triaged_count = max(cached_triaged, labeled_triaged)
 
-    # Dynamic False Positive calculation
+    # Share of triaged incidents verdicted FALSE_POSITIVE. None (not a made-up
+    # default) when nothing has been triaged yet.
     fp_cached = sum(1 for inc_id, r in TRIAGE_REPORTS_CACHE.items() if inc_id in incident_ids and r.get("verdict") == "FALSE_POSITIVE")
-    fp_rate = f"{round((fp_cached / max(1, cached_triaged)) * 100)}%" if cached_triaged > 0 else "38%"
+    fp_rate = f"{round((fp_cached / cached_triaged) * 100)}%" if cached_triaged > 0 else None
 
     timeline_text = f"Last {days} Days" if days and days > 1 else ("Last 24 Hours" if days == 1 else "All Time")
 
@@ -65,8 +67,10 @@ async def get_incident_stats(
         "medium_severity": med_count,
         "low_severity": low_count,
         "ai_triaged_count": triaged_count,
-        "avg_triage_time_seconds": 4.8 if triaged_count > 0 else 0.0,
-        "fp_reduction_rate": fp_rate,
+        # Per-incident triage timing is not measured yet; expose null rather than
+        # a fabricated constant so the UI can show N/A.
+        "avg_triage_time_seconds": None,
+        "false_positive_rate": fp_rate,
         "lookback_days": days or "all",
         "timeline_label": timeline_text
     }

@@ -44,7 +44,9 @@ export default function StatsOverview({
   const highCount = stats.high_severity || 0;
 
   const highPercent = total > 0 ? Math.round((highCount / total) * 100) : 0;
-  const triagedPercent = total > 0 ? Math.round((triagedCount / total) * 100) : 100;
+  const triagedPercent = total > 0 ? Math.round((triagedCount / total) * 100) : 0;
+  const avgTriageTime = stats.avg_triage_time_seconds;
+  const fpRate = stats.false_positive_rate;
 
   return (
     <div className="mb-6 space-y-3">
@@ -139,11 +141,11 @@ export default function StatsOverview({
           <div className="mt-2.5 flex items-baseline justify-between">
             <span className="text-2xl font-bold font-mono text-emerald-600 dark:text-emerald-400">{triagedCount}</span>
             <span className="text-[11px] text-emerald-600 dark:text-emerald-500 font-semibold font-mono">
-              100% Automated
+              {triagedPercent}% of Scope
             </span>
           </div>
           <div className="mt-1.5 flex items-center justify-between text-[10px] text-slate-400 border-t border-slate-100 dark:border-slate-800/60 pt-1.5">
-            <span>{triagedPercent}% Timeline Coverage</span>
+            <span>{triagedCount > 0 ? 'Triaged in timeline' : 'None triaged yet'}</span>
             <span className="font-mono text-emerald-500">Autonomous</span>
           </div>
         </div>
@@ -179,20 +181,20 @@ export default function StatsOverview({
           className="group cursor-pointer bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800/80 rounded-xl p-4 shadow-sm hover:border-cyan-400 dark:hover:border-cyan-500/50 hover:shadow-md transition-all relative overflow-hidden"
         >
           <div className="flex items-center justify-between">
-            <span className="text-xs font-semibold text-slate-500 dark:text-slate-400">FP Noise Reduction</span>
+            <span className="text-xs font-semibold text-slate-500 dark:text-slate-400">False Positive Rate</span>
             <div className="p-2 rounded-lg bg-cyan-500/10 text-cyan-600 dark:text-cyan-400 group-hover:scale-110 transition-transform">
               <CheckCircle2 className="w-4 h-4" />
             </div>
           </div>
           <div className="mt-2.5 flex items-baseline justify-between">
-            <span className="text-2xl font-bold font-mono text-cyan-600 dark:text-cyan-400">{stats.fp_reduction_rate}</span>
+            <span className="text-2xl font-bold font-mono text-cyan-600 dark:text-cyan-400">{fpRate ?? 'N/A'}</span>
             <span className="text-[11px] text-cyan-600/90 dark:text-cyan-400 font-semibold font-mono">
-              Suppressed
+              of triaged
             </span>
           </div>
           <div className="mt-1.5 flex items-center justify-between text-[10px] text-slate-400 border-t border-slate-100 dark:border-slate-800/60 pt-1.5">
-            <span>SOC Alert Fatigue Shield</span>
-            <span className="font-mono text-cyan-500">Auto-tuned</span>
+            <span>{fpRate != null ? 'Share verdicted false positive' : 'No triage data yet'}</span>
+            <span className="font-mono text-cyan-500">Measured</span>
           </div>
         </div>
 
@@ -205,13 +207,13 @@ export default function StatsOverview({
             </div>
           </div>
           <div className="mt-2.5 flex items-baseline justify-between">
-            <span className="text-2xl font-bold font-mono text-amber-600 dark:text-amber-400">{stats.avg_triage_time_seconds}s</span>
+            <span className="text-2xl font-bold font-mono text-amber-600 dark:text-amber-400">{avgTriageTime != null ? `${avgTriageTime}s` : 'N/A'}</span>
             <span className="text-[11px] text-amber-600/90 dark:text-amber-500 font-semibold font-mono">
-              vs 15m Human
+              per incident
             </span>
           </div>
           <div className="mt-1.5 flex items-center justify-between text-[10px] text-slate-400 border-t border-slate-100 dark:border-slate-800/60 pt-1.5">
-            <span>99.4% Latency Reduction</span>
+            <span>{avgTriageTime != null ? 'Measured average' : 'Not yet measured'}</span>
             <span className="font-mono text-amber-500">Real-time</span>
           </div>
         </div>

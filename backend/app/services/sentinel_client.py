@@ -2,12 +2,25 @@ import logging
 import uuid
 import re
 import asyncio
+import ipaddress
 import httpx
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _is_private_ip(addr: str) -> bool:
+    """True for RFC1918 / loopback / link-local addresses via real CIDR membership.
+
+    Replaces string-prefix checks that mislabeled public 172.2x/172.3x ranges
+    (e.g. Google's 172.217.x.x) as internal.
+    """
+    try:
+        return ipaddress.ip_address(addr).is_private
+    except ValueError:
+        return False
 
 # Sample Mock Incidents for Standalone Testing / Demo Mode
 MOCK_INCIDENTS: List[Dict[str, Any]] = [
@@ -219,7 +232,7 @@ def parse_sentinel_entity(e: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return {
             "kind": "Ip",
             "address": addr,
-            "location": location_str or ("Internal RFC1918" if addr.startswith(("10.", "192.168.", "172.16.", "172.17.", "172.18.", "172.19.", "172.2", "172.3")) else "External Public IP")
+            "location": location_str or ("Internal RFC1918" if _is_private_ip(addr) else "External Public IP")
         }
 
     elif k_lower in ["process"]:
@@ -284,7 +297,7 @@ def extract_entities_from_text(text: str) -> List[Dict[str, Any]]:
     for ip in ip_matches:
         if ip not in seen and not ip.startswith(("0.0.0.", "255.255.", "127.0.0.1")):
             seen.add(ip)
-            is_internal = ip.startswith(("10.", "192.168.", "172.16.", "172.17.", "172.18.", "172.19.", "172.2", "172.3"))
+            is_internal = _is_private_ip(ip)
             extracted.append({
                 "kind": "Ip",
                 "address": ip,
