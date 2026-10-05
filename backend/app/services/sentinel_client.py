@@ -559,8 +559,15 @@ class SentinelClient:
         filter_status: Optional[str],
         severity: Optional[str],
         time_range_days: Optional[int],
+        enrich: bool = True,
     ) -> List[Dict[str, Any]]:
-        """Fetch & map incidents from a single live workspace (namespaced)."""
+        """Fetch & map incidents from a single live workspace (namespaced).
+
+        ``enrich`` controls whether each incident's entity graph / comments / alerts
+        are fetched inline. This is skipped when aggregating the whole fleet (the
+        detail view re-fetches a single incident via ``get_incident`` anyway), so a
+        ~90-workspace aggregate view does not fan out into thousands of ARM calls.
+        """
         base_url = self._get_base_url(workspace)
         url = f"{base_url}/incidents?api-version=2023-11-01&$orderby=properties/createdTimeUtc desc"
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -606,7 +613,7 @@ class SentinelClient:
         enrichment_tasks = [
             self._fetch_incident_entities_and_comments(client, workspace, inc["id"], headers)
             for inc in results[:10]
-        ]
+        ] if enrich else []
         if enrichment_tasks:
             enrichment_results = await asyncio.gather(*enrichment_tasks, return_exceptions=True)
             for i, res in enumerate(enrichment_results):
@@ -683,20 +690,29 @@ class SentinelClient:
         if self.is_live:
             token = self._get_arm_token()
             if token:
+                live_targets = [ws for ws in targets if ws.has_arm_coordinates()]
+                # Enrich inline only for a single-workspace view; for fleet-wide
+                # aggregation skip it so we don't fan out into thousands of calls.
+                enrich = len(live_targets) == 1
+                # Bound concurrency so a ~90-workspace fleet doesn't open 90
+                # simultaneous ARM connections at once.
+                semaphore = asyncio.Semaphore(10)
                 results: List[Dict[str, Any]] = []
                 try:
-                    async with httpx.AsyncClient(timeout=20.0) as client:
-                        for ws in targets:
-                            if not ws.has_arm_coordinates():
-                                continue
-                            try:
-                                results.extend(
-                                    await self._list_live_for_workspace(
-                                        client, ws, token, filter_status, severity, time_range_days
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        async def _fetch_one(ws: WorkspaceConfig):
+                            async with semaphore:
+                                try:
+                                    return await self._list_live_for_workspace(
+                                        client, ws, token, filter_status, severity, time_range_days, enrich=enrich
                                     )
-                                )
-                            except Exception as e:
-                                logger.error(f"Exception listing incidents for workspace '{ws.id}': {e}")
+                                except Exception as e:
+                                    logger.error(f"Exception listing incidents for workspace '{ws.id}': {e}")
+                                    return []
+
+                        per_workspace = await asyncio.gather(*[_fetch_one(ws) for ws in live_targets])
+                        for chunk in per_workspace:
+                            results.extend(chunk)
                     return self._sort_incidents(results)
                 except Exception as e:
                     logger.error(f"Exception during multi-workspace incident retrieval: {e}")
