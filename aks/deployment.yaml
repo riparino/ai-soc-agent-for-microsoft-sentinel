@@ -50,6 +50,13 @@ spec:
                 name: sentinel-soc-config
             - secretRef:
                 name: sentinel-soc-secret
+          volumeMounts:
+            # Delegated Lighthouse workspace fleet (optional). Mounts workspaces.json
+            # at /etc/sentinel when the sentinel-soc-fleet ConfigMap exists; the app
+            # falls back to the single AZURE_* workspace when it is absent.
+            - name: fleet-config
+              mountPath: /etc/sentinel
+              readOnly: true
           livenessProbe:
             httpGet:
               path: /healthz
@@ -66,3 +73,11 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 2
+      volumes:
+        # Mounted from a Secret (the fleet file may carry per-customer Graph secrets).
+        # optional:true means the pod starts even without it (single-workspace mode);
+        # create the Secret from workspaces.json to enable the delegated fleet.
+        - name: fleet-config
+          secret:
+            secretName: sentinel-soc-fleet
+            optional: true

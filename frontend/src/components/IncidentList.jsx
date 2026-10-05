@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { ShieldAlert, Search, Clock, Calendar, User, UserCheck } from 'lucide-react';
+import { ShieldAlert, Search, Clock, Calendar, User, UserCheck, Building2 } from 'lucide-react';
 import { formatDateTime, formatRelativeTime, getUserTimezone } from '../utils/timezone';
 
 export default function IncidentList({
@@ -12,10 +12,14 @@ export default function IncidentList({
   setFilterStatus,
   filterDays,
   setFilterDays,
+  filterWorkspace = 'All',
+  setFilterWorkspace = () => {},
+  workspaces = [],
   searchQuery,
   setSearchQuery,
   loading
 }) {
+  const multiWorkspace = (workspaces?.length || 0) > 1;
   const [tz, setTz] = useState(getUserTimezone());
 
   useEffect(() => {
@@ -75,6 +79,24 @@ export default function IncidentList({
           <span className="text-xs bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300 px-2 py-0.5 rounded-full font-mono">
             {filteredIncidents.length} alerts
           </span>
+        </div>
+
+        {/* Workspace / Tenant Selector (Azure Lighthouse fleet) */}
+        <div className="relative">
+          <Building2 className="w-4 h-4 text-blue-500 absolute left-3 top-2.5 pointer-events-none" />
+          <select
+            value={filterWorkspace}
+            onChange={(e) => setFilterWorkspace(e.target.value)}
+            className="w-full pl-9 pr-3 py-1.5 bg-slate-100 dark:bg-slate-950 border border-slate-300 dark:border-slate-800 rounded-lg text-xs font-medium text-slate-800 dark:text-slate-200 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-colors"
+            title="Select a Microsoft Sentinel workspace / customer tenant, or aggregate across the whole fleet"
+          >
+            <option value="All">All Workspaces ({workspaces?.length || 0})</option>
+            {workspaces.map((ws) => (
+              <option key={ws.id} value={ws.id}>
+                {ws.display_name}{ws.graph_mode === 'log-analytics-only' ? ' · Lighthouse' : ''}
+              </option>
+            ))}
+          </select>
         </div>
 
         {/* Search */}
@@ -191,6 +213,19 @@ export default function IncidentList({
                 <h3 className="text-xs font-medium text-slate-800 dark:text-slate-100 line-clamp-2 leading-relaxed mb-1.5">
                   {inc.title}
                 </h3>
+
+                {/* Workspace / tenant origin (shown when aggregating the fleet) */}
+                {multiWorkspace && inc.workspaceName && (
+                  <div className="flex items-center mb-1.5">
+                    <span
+                      className="flex items-center space-x-1 bg-blue-500/10 text-blue-600 dark:text-blue-400 px-1.5 py-0.5 rounded text-[9px] font-medium border border-blue-500/20 max-w-full truncate"
+                      title={`Workspace: ${inc.workspaceName}`}
+                    >
+                      <Building2 className="w-2.5 h-2.5 shrink-0" />
+                      <span className="truncate">{inc.workspaceName}</span>
+                    </span>
+                  </div>
+                )}
 
                 {/* Incident Date & Time */}
                 <div className="flex items-center justify-between text-[10px] text-slate-500 dark:text-slate-400 font-mono mb-2 pb-1.5 border-b border-slate-200/60 dark:border-slate-800/60">

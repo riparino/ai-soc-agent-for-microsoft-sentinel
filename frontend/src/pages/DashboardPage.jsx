@@ -18,6 +18,8 @@ export default function DashboardPage() {
   const [filterSeverity, setFilterSeverity] = useState('All');
   const [filterStatus, setFilterStatus] = useState('All');
   const [filterDays, setFilterDays] = useState('All');
+  const [filterWorkspace, setFilterWorkspace] = useState('All');
+  const [workspaces, setWorkspaces] = useState([]);
   const [searchQuery, setSearchQuery] = useState('');
 
   // Right-side Workbench Sub-Tab
@@ -31,8 +33,8 @@ export default function DashboardPage() {
   const fetchIncidentsAndStats = async () => {
     try {
       const [incData, statsData] = await Promise.all([
-        incidentsApi.getIncidents(filterStatus, filterSeverity, filterDays),
-        incidentsApi.getStats(filterDays)
+        incidentsApi.getIncidents(filterStatus, filterSeverity, filterDays, filterWorkspace),
+        incidentsApi.getStats(filterDays, filterWorkspace)
       ]);
       setIncidents(incData);
       setStats(statsData);
@@ -50,9 +52,16 @@ export default function DashboardPage() {
     }
   };
 
+  // Load the managed workspace fleet once for the selector.
+  useEffect(() => {
+    incidentsApi.getWorkspaces()
+      .then((res) => setWorkspaces(res?.workspaces || []))
+      .catch(() => setWorkspaces([]));
+  }, []);
+
   useEffect(() => {
     fetchIncidentsAndStats();
-  }, [filterSeverity, filterStatus, filterDays]);
+  }, [filterSeverity, filterStatus, filterDays, filterWorkspace]);
 
   const handleQuickFilter = ({ severity, status }) => {
     if (severity !== undefined) setFilterSeverity(severity);
@@ -94,7 +103,7 @@ export default function DashboardPage() {
 
     // Open WebSocket for live telemetry streaming
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws/triage/${incident.id}`;
+    const wsUrl = `${protocol}//${window.location.host}/ws/triage/${encodeURIComponent(incident.id)}`;
     const ws = new WebSocket(wsUrl);
 
     ws.onmessage = (event) => {
@@ -158,6 +167,9 @@ export default function DashboardPage() {
             setFilterStatus={setFilterStatus}
             filterDays={filterDays}
             setFilterDays={setFilterDays}
+            filterWorkspace={filterWorkspace}
+            setFilterWorkspace={setFilterWorkspace}
+            workspaces={workspaces}
             searchQuery={searchQuery}
             setSearchQuery={setSearchQuery}
             loading={loading}

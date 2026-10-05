@@ -21,3 +21,9 @@ data:
   AZURE_CLIENT_ID: "YOUR_AZURE_CLIENT_ID"
   USE_MANAGED_IDENTITY: "false"
   AUTO_POST_COMMENTS_TO_SENTINEL: "true"
+  # Multi-tenant (Azure Lighthouse) fleet. The AZURE_SUBSCRIPTION_ID / _RESOURCE_GROUP_NAME
+  # / _WORKSPACE_NAME above describe only the single/default workspace. For a fleet of
+  # delegated workspaces, mount a workspaces.json via the sentinel-soc-fleet Secret
+  # (kubectl create secret generic sentinel-soc-fleet --from-file=workspaces.json=...)
+  # and point this at it. If the file is absent the app falls back to the single workspace.
+  WORKSPACES_CONFIG_PATH: "/etc/sentinel/workspaces.json"

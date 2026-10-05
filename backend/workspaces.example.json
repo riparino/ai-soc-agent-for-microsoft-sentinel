@@ -1,0 +1,35 @@
+{
+  "workspaces": [
+    {
+      "id": "home-soc",
+      "display_name": "Managing Tenant SOC",
+      "tenant_id": "00000000-0000-0000-0000-000000000000",
+      "subscription_id": "11111111-1111-1111-1111-111111111111",
+      "resource_group": "rg-sentinel-home",
+      "workspace_name": "home-soc-sentinel",
+      "workspace_guid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "is_managing_tenant": true
+    },
+    {
+      "id": "contoso",
+      "display_name": "Contoso Ltd",
+      "tenant_id": "22222222-2222-2222-2222-222222222222",
+      "subscription_id": "33333333-3333-3333-3333-333333333333",
+      "resource_group": "rg-sentinel-contoso",
+      "workspace_name": "contoso-sentinel",
+      "_comment": "Delegated via Azure Lighthouse. ARM + Log Analytics work with the home SP. Graph (identity) features are limited to SigninLogs telemetry unless a per-customer Graph app is added below."
+    },
+    {
+      "id": "fabrikam",
+      "display_name": "Fabrikam Inc",
+      "tenant_id": "44444444-4444-4444-4444-444444444444",
+      "subscription_id": "55555555-5555-5555-5555-555555555555",
+      "resource_group": "rg-sentinel-fabrikam",
+      "workspace_name": "fabrikam-sentinel",
+      "graph_tenant_id": "44444444-4444-4444-4444-444444444444",
+      "graph_client_id": "66666666-6666-6666-6666-666666666666",
+      "graph_client_secret": "<per-customer-graph-app-secret>",
+      "_comment": "Delegated via Lighthouse AND has a per-customer Graph app registration with admin consent, so identity read/write features are fully enabled for this tenant."
+    }
+  ]
+}

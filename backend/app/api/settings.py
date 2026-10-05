@@ -6,6 +6,7 @@ from app.auth.jwt_handler import get_current_user, User
 from app.services.sentinel_client import sentinel_client
 from app.services.kql_runner import kql_runner
 from app.services.threat_intel import threat_intel_service
+from app.services.workspace_registry import workspace_registry
 from app.agent.triage_agent import triage_agent
 
 router = APIRouter(prefix="/settings", tags=["Configuration & Health"])
@@ -61,11 +62,17 @@ async def get_system_status(current_user: User = Depends(get_current_user)):
             return k
         return "••••••••••••••••"
 
+    fleet = workspace_registry.list_workspaces()
+
     return {
         "app_name": settings.APP_NAME,
         "app_env": settings.APP_ENV,
         "demo_mode": settings.DEMO_MODE,
         "is_admin": is_admin,
+        "workspace_fleet": {
+            "count": len(fleet),
+            "workspaces": [w.public_dict() for w in fleet],
+        },
         "azure_sentinel": {
             "configured": azure_configured,
             "subscription_id": settings.AZURE_SUBSCRIPTION_ID or "simulated-subscription",
@@ -167,6 +174,10 @@ async def update_system_settings(req: SettingsUpdateRequest, current_user: User 
             f"AZURE_SUBSCRIPTION_ID={settings.AZURE_SUBSCRIPTION_ID or ''}",
             f"AZURE_RESOURCE_GROUP_NAME={settings.AZURE_RESOURCE_GROUP_NAME or ''}",
             f"AZURE_WORKSPACE_NAME={settings.AZURE_WORKSPACE_NAME or ''}",
+            f"AZURE_WORKSPACE_ID={settings.AZURE_WORKSPACE_ID or ''}",
+            # Preserve the multi-workspace fleet configuration so it is not dropped
+            # when the single/default workspace settings are saved from the portal.
+            f"WORKSPACES_CONFIG_PATH={settings.WORKSPACES_CONFIG_PATH or ''}",
             f"AZURE_TENANT_ID={settings.AZURE_TENANT_ID or ''}",
             f"AZURE_CLIENT_ID={settings.AZURE_CLIENT_ID or ''}",
             f"AZURE_CLIENT_SECRET={settings.AZURE_CLIENT_SECRET or ''}",
@@ -190,7 +201,8 @@ async def update_system_settings(req: SettingsUpdateRequest, current_user: User 
         logging.getLogger(__name__).warning(f"Could not persist settings to .env file: {err}")
 
     try:
-        # Re-initialize clients with updated configs
+        # Reload the workspace fleet, then re-initialize clients with updated configs.
+        workspace_registry.reload()
         sentinel_client._init_client()
         kql_runner._init_azure_client()
         triage_agent._init_llm_client()
