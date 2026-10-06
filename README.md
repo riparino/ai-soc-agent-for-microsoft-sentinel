@@ -1,4 +1,36 @@
-# 🛡️ Microsoft Sentinel AI SOC Agent — Multi-Tenant Autonomous Triage
+# 🛡️ Microsoft Sentinel AI SOC Agent — Local Analyst MCP Server
+
+> **You are on `analyst-local`, the default branch.** It holds the version each
+> analyst runs **on their own machine**: an MCP server that plugs Microsoft Sentinel
+> — across every customer workspace delegated to you via Azure Lighthouse — into
+> Claude Desktop, Claude Code or VS Code. It authenticates as the signed-in analyst
+> (`az login`), so there are no secrets on laptops and every action in Sentinel is
+> attributed to the person who took it.
+>
+> **Analyst quick start** (full runbook: [`backend/docs/ANALYST_LOCAL_SETUP.md`](backend/docs/ANALYST_LOCAL_SETUP.md)):
+>
+> ```bash
+> az login --tenant <managing-tenant-id>
+> git clone https://github.com/riparino/ai-soc-agent-for-microsoft-sentinel.git
+> cd ai-soc-agent-for-microsoft-sentinel/backend
+> python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt   # Windows: .\venv\Scripts\Activate.ps1
+> cp .env.example .env    # set DEMO_MODE=False, AZURE_AUTH_MODE=user, AZURE_TENANT_ID, WORKSPACES_CONFIG_PATH
+> ./run-mcp.sh --check                          # Windows: .\run-mcp.ps1 --check
+> ./run-mcp.sh --print-config claude-desktop    # paste into your MCP client (or: vscode, claude-code)
+> ```
+>
+> **Branch map**
+>
+> | Branch | Purpose |
+> |--------|---------|
+> | `analyst-local` (default) | Per-analyst local MCP server — this branch. Also contains the shared backend (fleet registry, Sentinel/KQL clients) and the Copilot Studio-ready MCP server. |
+> | `web-console` (formerly `main`) | The hosted web SOC console (FastAPI + React) for a shared deployment; the multi-tenant re-architecture PR lands here. |
+> | `claude/*` | Working branches behind the pull requests; not for direct use. |
+
+---
+
+## The platform underneath
+
 
 An autonomous AI SOC analyst for **Microsoft Sentinel**, built for **MSSPs and
 multi-tenant enterprises**. A single deployment manages a **fleet of Sentinel
