@@ -21,6 +21,7 @@ every tenant, from your managing tenant.
 - [Configuration reference](#-configuration-reference)
 - [Deployment](#-deployment)
 - [Using the workbench](#-using-the-workbench)
+- [MCP server (Claude, GitHub Copilot, Copilot Studio)](#-mcp-server-claude-github-copilot-copilot-studio)
 - [Testing](#-testing)
 - [Repository layout](#-repository-layout)
 
@@ -411,6 +412,38 @@ kubectl rollout restart deployment/sentinel-soc-agent -n sentinel-soc
 
 ---
 
+## 🔌 MCP server (Claude, GitHub Copilot, Copilot Studio)
+
+The agent's capabilities are also exposed as **Model Context Protocol** tools
+(`backend/app/mcp_server.py`) so analysts can run fleet‑wide triage from the
+assistants they already use — Claude (Enterprise connectors, Desktop, Claude Code),
+GitHub Copilot (VS Code agent mode / coding agent), and Microsoft Copilot Studio
+(and from there, Teams).
+
+```bash
+cd backend
+./run-mcp.sh                                 # stdio — local clients, zero network, great for testing
+./run-mcp.sh --transport streamable-http     # http://127.0.0.1:8800/mcp (no auth; loopback only)
+MCP_AUTH_MODE=entra ./run-mcp.sh --transport streamable-http --host 0.0.0.0   # shared / remote
+```
+
+- **13 tools**: list workspaces/incidents, get incident, run AI triage, fetch report,
+  KQL, threat intel, comment, status/classification, assign, remediate. Namespaced
+  incident refs route every call to the right delegated tenant; destructive tools
+  are annotated so clients confirm first, and the Graph/Lighthouse guardrail applies.
+- **Local**: add `backend/run-mcp.sh` as a stdio server in Claude Code
+  (`claude mcp add sentinel-soc -- /path/backend/run-mcp.sh`), Claude Desktop, or
+  VS Code `.vscode/mcp.json`. Works fully in `DEMO_MODE` with no Azure.
+- **Remote**: Streamable HTTP with **Microsoft Entra ID** bearer auth
+  (`MCP_AUTH_MODE=entra`, `MCP_ENTRA_AUDIENCE=<app id>`): tokens are validated
+  against your tenant's JWKS and the server publishes RFC 9728 protected‑resource
+  metadata for client OAuth discovery.
+
+👉 Setup for each client, Entra app registration, and deployment:
+[`backend/docs/MCP_SERVER.md`](backend/docs/MCP_SERVER.md).
+
+---
+
 ## 🧪 Testing
 
 ```bash
@@ -436,6 +469,7 @@ backend/
     services/remediation_service.py  # SOAR + Graph-scope guardrails
     agent/                           # autonomous triage agent + tools
     api/                             # incidents / triage / settings routes
+    mcp_server.py                    # MCP server (stdio + Streamable HTTP, Entra auth)
   docs/MULTI_TENANT.md               # architecture + registry schema (deep dive)
   workspaces.example.json            # fleet file template
 frontend/                            # React + Tailwind SOC workbench

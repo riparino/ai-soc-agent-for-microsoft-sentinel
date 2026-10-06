@@ -10,8 +10,9 @@ from app.agent.triage_agent import triage_agent
 
 router = APIRouter(prefix="/triage", tags=["AI Triage"])
 
-# Store generated triage reports in memory
-TRIAGE_REPORTS_CACHE: Dict[str, Dict[str, Any]] = {}
+# Generated triage reports live in a shared, dependency-free store so the MCP
+# server can read/write the same cache without importing this HTTP/auth layer.
+from app.services.triage_store import TRIAGE_REPORTS_CACHE  # noqa: E402,F401
 
 class ChatRequest(BaseModel):
     message: str

@@ -62,6 +62,19 @@ class Settings(BaseSettings):
     ENABLE_MICROSOFT_THREAT_INTEL: bool = True
     MDTI_API_KEY: Optional[str] = None
     
+    # MCP server (exposes the agent's tools to Claude, GitHub Copilot, Copilot Studio…)
+    # Transport is chosen on the CLI (`python -m app.mcp_server --transport stdio|streamable-http`).
+    # Auth applies to the HTTP transport only:
+    #   none  - no bearer auth (local testing / stdio).
+    #   entra - validate Microsoft Entra ID bearer tokens (JWKS) issued for MCP_ENTRA_AUDIENCE.
+    MCP_AUTH_MODE: str = "none"
+    MCP_HOST: str = "127.0.0.1"
+    MCP_PORT: int = 8800
+    MCP_PUBLIC_URL: Optional[str] = None            # e.g. https://soc-mcp.example.com/mcp
+    MCP_ENTRA_TENANT_ID: Optional[str] = None       # defaults to AZURE_TENANT_ID
+    MCP_ENTRA_AUDIENCE: Optional[str] = None        # app (client) ID or api://<id>; comma-separated list allowed
+    MCP_REQUIRED_SCOPES: Optional[str] = None       # comma-separated scp/roles that must be present, e.g. Sentinel.Triage
+
     # Auto-Triage & Polling Settings
     ENABLE_AUTO_POLLING: bool = False
     POLL_INTERVAL_SECONDS: int = 120

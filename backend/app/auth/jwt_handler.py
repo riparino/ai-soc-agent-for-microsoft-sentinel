@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 import hashlib
 import secrets
+import sys
 from jose import JWTError, jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
@@ -103,7 +104,9 @@ def init_default_users() -> dict:
         banner += "=" * 80 + "\n"
         auth_logger.warning(banner)
         try:
-            print(banner)
+            # stderr, never stdout: stdout may be a machine channel (e.g. the MCP
+            # stdio transport) or captured into logs/pipes where passwords don't belong.
+            print(banner, file=sys.stderr)
         except Exception:
             pass
 
