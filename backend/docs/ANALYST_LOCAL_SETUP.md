@@ -9,9 +9,10 @@ is recorded in Sentinel under your name.
 
 ## What you need (one-time, from your SOC admin)
 
-- Membership in the SOC analysts group that holds the Lighthouse authorizations
-  (**Microsoft Sentinel Responder** + **Log Analytics Reader** on the customer
-  subscriptions). Read-only role = you can list/triage but not comment or close.
+- You should already be a member of **`lighthouse-sentinel-responders`**, the group
+  that holds the Lighthouse authorizations (**Microsoft Sentinel Responder** +
+  **Log Analytics Reader** on the customer subscriptions). Nothing to request —
+  if a customer workspace later shows `403`, that group's delegation is what to check.
 - Our managing tenant ID.
 - Python 3.11+, Git, and the **Azure CLI** (`az`).
 
@@ -134,18 +135,19 @@ on its own. Restart the client and try:
 |---------|-----|
 | `--check` says *NOT LIVE - no usable credentials* | `.env` has `DEMO_MODE=False` and `AZURE_AUTH_MODE=user`? Then run `az login --tenant <managing-tenant-id>`. |
 | *Signed in as: FAILED to obtain an ARM token* | No CLI session for that tenant: `az login --tenant …`. On Windows make sure `az` is on PATH for the same user. |
-| A workspace shows `403` | Your account lacks a delegated role on that customer subscription — ask the admin to add you to the Lighthouse-authorized group. |
+| A workspace shows `403` | `lighthouse-sentinel-responders` isn't authorized on that customer's delegation (or you've dropped out of the group). Ask the admin. |
 | A workspace shows `404` | Typo in the fleet file (subscription id / resource group / workspace name). |
 | `--check` says *fleet file not found* / only sample workspaces load | Run `./run-mcp.sh --discover-workspaces`, or point `WORKSPACES_CONFIG_PATH` at your file (relative paths resolve against the `backend` folder). |
-| Discovery finds fewer customers than you expect | Resource Graph only returns what your account can read: ask the admin to confirm your SOC-Analysts membership covers that customer's delegation. |
+| Discovery finds fewer customers than you expect | Resource Graph only returns what your account can read: ask the admin to confirm the `lighthouse-sentinel-responders` delegation covers that customer. |
 | Windows: *running scripts is disabled* | `powershell -ExecutionPolicy Bypass -File .\run-mcp.ps1 --check` |
 | Browser login wanted instead of CLI | set `AZURE_INTERACTIVE_LOGIN=True` (opens a browser when no CLI session exists). |
 
 ## For the SOC admin: rolling this out
 
-1. **Lighthouse**: assign Sentinel Responder + Log Analytics Reader to a security
-   group (e.g. `SOC-Analysts`) in each customer delegation; add analysts to the
-   group — no per-analyst Azure changes afterwards.
+1. **Lighthouse**: `lighthouse-sentinel-responders` carries Sentinel Responder +
+   Log Analytics Reader in each customer delegation; analysts are already members,
+   so onboarding a customer means authorizing that group in the new delegation —
+   no per-analyst Azure changes.
 2. **Fleet file**: analysts generate their own with `--discover-workspaces`
    (Azure Resource Graph, scoped to what their account can read). If you prefer a
    curated list, publish `workspaces.json` with coordinates only, and never put
