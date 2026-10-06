@@ -419,6 +419,67 @@ class SentinelClient:
             logger.debug(f"Could not resolve workspace GUID for '{workspace.id}': {e}")
         return workspace.workspace_guid
 
+    # ------------------------------------------------------- owner / etag utils
+    @staticmethod
+    def _is_guid(value: Optional[str]) -> bool:
+        return bool(value) and re.fullmatch(r"[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}", str(value)) is not None
+
+    @staticmethod
+    def _owner_from_props(props: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalise Sentinel's IncidentOwnerInfo for API consumers."""
+        o = props.get("owner") or {}
+        return {
+            "objectId": o.get("objectId"),
+            "userPrincipalName": o.get("userPrincipalName"),
+            "email": o.get("email"),
+            "assignedTo": o.get("assignedTo"),
+            "ownerType": o.get("ownerType"),
+        }
+
+    @staticmethod
+    def _owner_is_set(owner: Optional[Dict[str, Any]]) -> bool:
+        return bool(owner and (owner.get("objectId") or owner.get("userPrincipalName") or owner.get("assignedTo") or owner.get("email")))
+
+    @staticmethod
+    def _same_owner(owner: Optional[Dict[str, Any]], user_id: Optional[str], user_upn: Optional[str], user_name: Optional[str]) -> bool:
+        if not owner:
+            return False
+        if user_id and owner.get("objectId") and str(owner["objectId"]).lower() == str(user_id).lower():
+            return True
+        if user_upn and owner.get("userPrincipalName") and str(owner["userPrincipalName"]).lower() == str(user_upn).lower():
+            return True
+        if user_upn and owner.get("email") and str(owner["email"]).lower() == str(user_upn).lower():
+            return True
+        return bool(user_name and owner.get("assignedTo") and owner["assignedTo"] == user_name and not owner.get("userPrincipalName"))
+
+    @staticmethod
+    def _mock_owner(inc: Dict[str, Any]) -> Dict[str, Any]:
+        o = inc.get("owner") or {}
+        return {
+            "objectId": o.get("objectId"),
+            "userPrincipalName": o.get("userPrincipalName"),
+            "email": o.get("email"),
+            "assignedTo": inc.get("assignedTo") or o.get("assignedTo"),
+            "ownerType": o.get("ownerType"),
+        }
+
+    @staticmethod
+    def _mock_bump(inc: Dict[str, Any]) -> str:
+        """Emulate ARM etags on mock incidents so conflict handling is testable."""
+        inc["etag"] = str(int(inc.get("etag") or 0) + 1)
+        inc["lastModifiedTimeUtc"] = datetime.utcnow().isoformat() + "Z"
+        return inc["etag"]
+
+    @staticmethod
+    def _conflict(incident_id: str, current_etag: Optional[str], owner: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return {
+            "status": "CONFLICT",
+            "message": f"Incident {incident_id} was modified by someone else since it was read.",
+            "current_etag": current_etag,
+            "owner": owner,
+            "hint": "Re-read the incident (sentinel_get_incident) and retry with its current etag.",
+        }
+
     # ------------------------------------------------------------- namespacing
     def _namespace(self, incident: Dict[str, Any], workspace: WorkspaceConfig) -> Dict[str, Any]:
         """Stamp workspace routing metadata and namespace the incident id."""
@@ -775,6 +836,8 @@ class SentinelClient:
                                 "tactics": props.get("tactics", []),
                                 "techniques": [],
                                 "assignedTo": owner.get("assignedTo", owner_upn),
+                                "owner": self._owner_from_props(props),
+                                "etag": item.get("etag"),
                                 "classification": props.get("classification"),
                                 "classificationReason": props.get("classificationReason"),
                                 "classificationComment": props.get("classificationComment"),
@@ -790,7 +853,7 @@ class SentinelClient:
         # Mock fallback.
         for inc in MOCK_INCIDENTS:
             if inc["id"] == raw_id or str(inc.get("incidentNumber")) == raw_id:
-                return self._namespace({**inc}, workspace)
+                return self._namespace({**inc, "owner": self._mock_owner(inc), "etag": inc.get("etag") or "0"}, workspace)
         return None
 
     async def add_comment(self, incident_id: str, message: str, author: str = "AI Sentinel Triage Agent") -> Dict[str, Any]:
@@ -824,7 +887,7 @@ class SentinelClient:
         for inc in MOCK_INCIDENTS:
             if inc["id"] == raw_id or str(inc.get("incidentNumber")) == raw_id:
                 inc.setdefault("comments", []).append(comment_entry)
-                inc["lastModifiedTimeUtc"] = datetime.utcnow().isoformat() + "Z"
+                self._mock_bump(inc)
                 return {"status": "SUCCESS", "comment": comment_entry}
         return {"status": "NOT_FOUND", "message": f"Incident {incident_id} not found."}
 
@@ -837,9 +900,16 @@ class SentinelClient:
         classification_reason: Optional[str] = None,
         classification_comment: Optional[str] = None,
         labels: Optional[List[str]] = None,
-        updated_by: str = "SOC Analyst"
+        updated_by: str = "SOC Analyst",
+        expected_etag: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Update incident status/classification in the incident's origin workspace."""
+        """Update incident status/classification in the incident's origin workspace.
+
+        Writes are optimistic: the PUT carries ``If-Match`` with the etag just read
+        (or ``expected_etag`` if the caller read the incident earlier), so a
+        concurrent change by another analyst yields ``CONFLICT`` instead of a
+        silent last-writer-wins overwrite.
+        """
         workspace, raw_id = workspace_registry.resolve_ref(incident_id)
 
         if self.is_live and workspace.has_arm_coordinates():
@@ -853,7 +923,11 @@ class SentinelClient:
                     async with httpx.AsyncClient(timeout=15.0) as client:
                         r_get = await client.get(url, headers=headers)
                         if r_get.status_code == 200:
-                            props = r_get.json().get("properties", {})
+                            current = r_get.json()
+                            current_etag = current.get("etag")
+                            if expected_etag and current_etag and expected_etag != current_etag:
+                                return self._conflict(incident_id, current_etag, self._owner_from_props(current.get("properties", {})))
+                            props = current.get("properties", {})
                             props["status"] = status
                             if severity:
                                 props["severity"] = severity
@@ -878,7 +952,16 @@ class SentinelClient:
                             if labels:
                                 props["labels"] = [{"labelName": l, "labelType": "User"} for l in labels]
 
-                            resp = await client.put(url, headers=headers, json={"properties": props})
+                            put_headers = dict(headers)
+                            if current_etag:
+                                put_headers["If-Match"] = current_etag
+                            body = {"properties": props}
+                            if current_etag:
+                                body["etag"] = current_etag
+                            resp = await client.put(url, headers=put_headers, json=body)
+                            if resp.status_code in (409, 412):
+                                logger.warning(f"Concurrent modification updating incident {raw_id} in '{workspace.id}' (HTTP {resp.status_code}).")
+                                return self._conflict(incident_id, None)
                             if resp.status_code in [200, 201]:
                                 logger.info(f"Updated incident {raw_id} in '{workspace.id}' status to {status}.")
                                 if status == "Closed":
@@ -901,6 +984,8 @@ class SentinelClient:
         # Mock fallback.
         for inc in MOCK_INCIDENTS:
             if inc["id"] == raw_id or str(inc.get("incidentNumber")) == raw_id:
+                if expected_etag is not None and str(expected_etag) != str(inc.get("etag") or "0"):
+                    return self._conflict(incident_id, inc.get("etag") or "0", self._mock_owner(inc))
                 inc["status"] = status
                 if severity:
                     inc["severity"] = severity
@@ -916,8 +1001,8 @@ class SentinelClient:
                     current_labels = set(inc.get("labels", []))
                     current_labels.update(labels)
                     inc["labels"] = list(current_labels)
-                inc["lastModifiedTimeUtc"] = datetime.utcnow().isoformat() + "Z"
-                return {"status": "SUCCESS", "incident": self._namespace({**inc}, workspace)}
+                self._mock_bump(inc)
+                return {"status": "SUCCESS", "incident": self._namespace({**inc, "owner": self._mock_owner(inc)}, workspace)}
         return {"status": "NOT_FOUND", "message": f"Incident {incident_id} not found."}
 
     async def get_entra_users(self, workspace: Optional[WorkspaceConfig] = None) -> List[Dict[str, Any]]:
@@ -1046,18 +1131,37 @@ class SentinelClient:
         user_name: Optional[str] = None,
         user_email: Optional[str] = None,
         user_upn: Optional[str] = None,
-        assigned_by: str = "SOC Analyst"
+        assigned_by: str = "SOC Analyst",
+        only_if_unassigned: bool = False,
+        expected_etag: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Assign/unassign an incident in its origin workspace."""
+        """Assign/unassign an incident in its origin workspace.
+
+        With ``only_if_unassigned`` the call acts as a *claim*: it succeeds only if
+        nobody else owns the incident (re-claiming your own incident is fine) and
+        returns ``ALREADY_ASSIGNED`` otherwise. The PUT is ETag-conditional, so two
+        analysts claiming at once cannot both win: the loser gets ``CONFLICT`` or
+        ``ALREADY_ASSIGNED`` instead of silently overwriting the first claim.
+        """
         workspace, raw_id = workspace_registry.resolve_ref(incident_id)
         is_unassigning = not bool(user_upn or user_name or user_id)
 
-        owner_obj = {
-            "objectId": user_id or None,
+        owner_obj: Dict[str, Any] = {
+            "objectId": user_id if (user_id and self._is_guid(user_id)) else None,
             "email": user_email or user_upn or None,
             "assignedTo": user_name if not is_unassigning else None,
-            "userPrincipalName": user_upn if not is_unassigning else None
+            "userPrincipalName": user_upn if not is_unassigning else None,
         }
+        if not is_unassigning:
+            owner_obj["ownerType"] = "User"
+
+        def _already(owner: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                "status": "ALREADY_ASSIGNED",
+                "message": f"Incident is already assigned to {owner.get('assignedTo') or owner.get('userPrincipalName') or owner.get('email')}.",
+                "owner": owner,
+                "hint": "Coordinate with the current owner, or assign without only_if_unassigned to take it over deliberately.",
+            }
 
         if self.is_live and workspace.has_arm_coordinates():
             token = self._get_arm_token()
@@ -1070,10 +1174,26 @@ class SentinelClient:
                     async with httpx.AsyncClient(timeout=15.0) as client:
                         r_get = await client.get(url, headers=headers)
                         if r_get.status_code == 200:
-                            props = r_get.json().get("properties", {})
+                            current = r_get.json()
+                            current_etag = current.get("etag")
+                            props = current.get("properties", {})
+                            current_owner = self._owner_from_props(props)
+                            if expected_etag and current_etag and expected_etag != current_etag:
+                                return self._conflict(incident_id, current_etag, current_owner)
+                            if only_if_unassigned and self._owner_is_set(current_owner) and not self._same_owner(current_owner, user_id, user_upn, user_name):
+                                return _already(current_owner)
                             props["owner"] = owner_obj
 
-                            resp = await client.put(url, headers=headers, json={"properties": props})
+                            put_headers = dict(headers)
+                            if current_etag:
+                                put_headers["If-Match"] = current_etag
+                            body = {"properties": props}
+                            if current_etag:
+                                body["etag"] = current_etag
+                            resp = await client.put(url, headers=put_headers, json=body)
+                            if resp.status_code in (409, 412):
+                                logger.warning(f"Concurrent modification assigning incident {raw_id} in '{workspace.id}' (HTTP {resp.status_code}).")
+                                return self._conflict(incident_id, None)
                             if resp.status_code in [200, 201]:
                                 assign_desc = "unassigned" if is_unassigning else f"assigned to {user_name} ({user_upn})"
                                 logger.info(f"Incident {raw_id} in '{workspace.id}' successfully {assign_desc}.")
@@ -1093,8 +1213,14 @@ class SentinelClient:
         # Mock fallback.
         for inc in MOCK_INCIDENTS:
             if inc["id"] == raw_id or str(inc.get("incidentNumber")) == raw_id:
-                inc["assignedTo"] = user_name or user_upn if not is_unassigning else None
-                inc["lastModifiedTimeUtc"] = datetime.utcnow().isoformat() + "Z"
+                current_owner = self._mock_owner(inc)
+                if expected_etag is not None and str(expected_etag) != str(inc.get("etag") or "0"):
+                    return self._conflict(incident_id, inc.get("etag") or "0", current_owner)
+                if only_if_unassigned and self._owner_is_set(current_owner) and not self._same_owner(current_owner, user_id, user_upn, user_name):
+                    return _already(current_owner)
+                inc["assignedTo"] = (user_name or user_upn) if not is_unassigning else None
+                inc["owner"] = dict(owner_obj) if not is_unassigning else {}
+                self._mock_bump(inc)
                 assign_desc = "unassigned" if is_unassigning else f"assigned to {user_name} ({user_upn})"
                 inc.setdefault("comments", []).append({
                     "id": f"c-{uuid.uuid4().hex[:6]}",

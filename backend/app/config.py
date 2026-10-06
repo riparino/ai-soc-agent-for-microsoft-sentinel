@@ -92,6 +92,14 @@ class Settings(BaseSettings):
     # counts every MCP tool against the agent's tool limit.
     MCP_DISABLED_TOOLS: Optional[str] = None        # e.g. "sentinel_check_ip_reputation,sentinel_check_file_hash"
 
+    # Triage coordination between analysts. Sentinel's incident owner is the lock:
+    # when claiming is on, running triage first assigns an unassigned incident to the
+    # running analyst (ETag-conditional write) and refuses to triage one that another
+    # analyst already owns. Recently-triaged incidents (an AI triage comment younger
+    # than TRIAGE_DEDUPE_MINUTES) are not re-triaged unless forced.
+    TRIAGE_CLAIM_ON_RUN: bool = True
+    TRIAGE_DEDUPE_MINUTES: int = 30
+
     # Auto-Triage & Polling Settings
     ENABLE_AUTO_POLLING: bool = False
     POLL_INTERVAL_SECONDS: int = 120

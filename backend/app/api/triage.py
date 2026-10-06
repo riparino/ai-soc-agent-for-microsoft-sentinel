@@ -35,15 +35,32 @@ async def execute_kql_query(
     return result
 
 @router.post("/{incident_id}/run")
-async def run_triage(incident_id: str, current_user: User = Depends(get_current_user)):
-    """Run full automated AI triage on a Sentinel incident"""
-    incident = await sentinel_client.get_incident(incident_id)
-    if not incident:
+async def run_triage(
+    incident_id: str,
+    claim: bool = Query(False, description="Claim the incident (assign to you if unassigned; refuse if another analyst owns it) and skip incidents triaged within TRIAGE_DEDUPE_MINUTES."),
+    force: bool = Query(False, description="With claim: triage even if owned by someone else or recently triaged (ownership is not changed)."),
+    current_user: User = Depends(get_current_user),
+):
+    """Run full automated AI triage on a Sentinel incident.
+
+    Without ``claim`` this behaves as before (always runs). With ``claim`` the
+    coordinator uses Sentinel's incident owner as the lock so analysts don't collide;
+    it may return ALREADY_ASSIGNED / RECENTLY_TRIAGED instead of a report."""
+    from app.services.triage_coordinator import run_coordinated_triage
+
+    actor = {
+        "kind": "user",
+        "name": current_user.full_name,
+        "upn": current_user.email,
+        "email": current_user.email,
+        "object_id": None,
+    }
+    result = await run_coordinated_triage(
+        incident_id, actor=actor, claim=claim, dedupe=claim, force=force
+    )
+    if result.get("status") == "NOT_FOUND":
         raise HTTPException(status_code=404, detail=f"Incident {incident_id} not found")
-    
-    report = await triage_agent.triage_incident(incident)
-    TRIAGE_REPORTS_CACHE[incident_id] = report
-    return report
+    return result
 
 @router.get("/{incident_id}/report")
 async def get_triage_report(incident_id: str, current_user: User = Depends(get_current_user)):

@@ -362,7 +362,6 @@ def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
     from app.services.kql_runner import kql_runner
     from app.services.threat_intel import threat_intel_service
     from app.services.remediation_service import remediation_service
-    from app.agent.triage_agent import triage_agent
     # Shared with the REST/WebSocket API. Deliberately NOT imported from app.api.*
     # so this server never pulls in the HTTP/auth layer (whose import prints the
     # first-run credential banner — fatal on the stdio transport where stdout is
@@ -477,8 +476,17 @@ def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
     @tool("sentinel_triage_incident", title="Run AI triage on an incident", annotations=WRITE_SAFE)
     async def sentinel_triage_incident(
         incident_ref: Annotated[str, Field(description=REF_DESCRIPTION, min_length=1)],
+        claim: Annotated[bool, Field(description="Claim the incident first: assign it to you if unassigned, and refuse if another analyst owns it. Prevents two analysts triaging the same incident.")] = True,
+        force: Annotated[bool, Field(description="Triage even if another analyst owns it or it was triaged within the last TRIAGE_DEDUPE_MINUTES. Never changes ownership.")] = False,
     ) -> dict[str, Any]:
         """Run the autonomous triage investigation on an incident and return the report.
+
+        Coordination (so analysts don't collide): with ``claim`` (default) the incident is
+        first assigned to you if nobody owns it, using an ETag-conditional write — if
+        another analyst owns it, or claimed it a moment earlier, you get
+        ``ALREADY_ASSIGNED`` with the owner instead of a duplicate investigation. If an AI
+        triage comment was posted within the dedupe window you get ``RECENTLY_TRIAGED``
+        pointing at the existing findings. Pass ``force=true`` to run anyway.
 
         The agent extracts entities, checks threat intelligence, runs KQL hunts against the
         incident's own workspace, and produces a verdict (TRUE_POSITIVE / FALSE_POSITIVE /
@@ -487,12 +495,20 @@ def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
         the summary is also posted back to the incident as a comment in its tenant.
         Can take 10-60 seconds. Use sentinel_get_triage_report to fetch an existing report.
         """
-        incident = await sentinel_client.get_incident(incident_ref)
-        if not incident:
+        from app.services.azure_credentials import get_signed_in_identity
+        from app.services.triage_coordinator import run_coordinated_triage
+
+        actor = get_signed_in_identity(sentinel_client.credential) if sentinel_client.credential else None
+        result = await run_coordinated_triage(
+            incident_ref,
+            actor=actor,
+            claim=claim and settings.TRIAGE_CLAIM_ON_RUN,
+            dedupe=True,
+            force=force,
+        )
+        if result.get("status") == "NOT_FOUND":
             return _not_found(incident_ref)
-        report = await triage_agent.triage_incident(incident)
-        TRIAGE_REPORTS_CACHE[incident["id"]] = report
-        return report
+        return result
 
     @tool("sentinel_get_triage_report", title="Get existing triage report", annotations=READ_ONLY)
     async def sentinel_get_triage_report(
@@ -571,11 +587,13 @@ def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
         classification_comment: Annotated[str, Field(description="Closing notes recorded on the incident. Empty = default note.")] = "",
         labels: Annotated[list[str], Field(description="Labels/tags to apply to the incident. Empty list = unchanged.")] = [],
         updated_by: Annotated[str, Field(description="Analyst / agent name recorded in the audit comment. Empty = the signed-in analyst (local user mode) or 'AI SOC Agent (MCP)'.")] = "",
+        expected_etag: Annotated[str, Field(description="Optional etag from sentinel_get_incident; the write fails with CONFLICT if the incident changed since. Empty = skip this check (the write is still ETag-protected against concurrent edits).")] = "",
     ) -> dict[str, Any]:
         """Change an incident's status, severity, classification, or labels in its Sentinel
         workspace. Closing an incident is a significant action: confirm with the analyst
         first and always supply a ``classification`` (and ideally a reason/comment). An
-        audit comment is posted automatically."""
+        audit comment is posted automatically. Writes are ETag-conditional: if another
+        analyst changed the incident concurrently you get CONFLICT — re-read and retry."""
         if status == "Closed" and not _opt(classification):
             return {
                 "error": "CLASSIFICATION_REQUIRED",
@@ -590,6 +608,7 @@ def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
             classification_comment=_opt(classification_comment),
             labels=list(labels) or None,
             updated_by=_actor(updated_by),
+            expected_etag=_opt(expected_etag),
         )
         return result if result.get("status") != "NOT_FOUND" else _not_found(incident_ref)
 
@@ -600,9 +619,13 @@ def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
         user_name: Annotated[str, Field(description="Display name of the assignee.")] = "",
         user_id: Annotated[str, Field(description="Entra object id of the assignee, if known.")] = "",
         assigned_by: Annotated[str, Field(description="Who performed the assignment (audit comment). Empty = the signed-in analyst (local user mode) or 'AI SOC Agent (MCP)'.")] = "",
+        only_if_unassigned: Annotated[bool, Field(description="Claim semantics: succeed only if nobody else owns the incident (returns ALREADY_ASSIGNED otherwise). Use this to take an incident safely.")] = False,
+        expected_etag: Annotated[str, Field(description="Optional etag from sentinel_get_incident; the write fails with CONFLICT if the incident changed since. Empty = skip this check (the write is still ETag-protected against concurrent edits).")] = "",
     ) -> dict[str, Any]:
         """Assign an incident to a SOC engineer in its tenant, or unassign it when all user
-        fields are empty. Posts an audit comment on the incident."""
+        fields are empty. Posts an audit comment on the incident. Writes are
+        ETag-conditional, so concurrent assignments return CONFLICT rather than
+        overwriting each other."""
         result = await sentinel_client.assign_incident(
             incident_ref,
             user_id=_opt(user_id),
@@ -610,6 +633,8 @@ def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
             user_email=_opt(user_upn),
             user_upn=_opt(user_upn),
             assigned_by=_actor(assigned_by),
+            only_if_unassigned=only_if_unassigned,
+            expected_etag=_opt(expected_etag),
         )
         return result if result.get("status") != "NOT_FOUND" else _not_found(incident_ref)
 

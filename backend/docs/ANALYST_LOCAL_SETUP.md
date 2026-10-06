@@ -121,6 +121,14 @@ on its own. Restart the client and try:
 - `az login` sessions expire (typically after your tenant's policy, often ~90 days
   of inactivity, sooner with Conditional Access). If tools start failing with 401,
   run `az login --tenant <managing-tenant-id>` again and retry.
+- **Triage claims the incident for you.** `sentinel_triage_incident` first assigns an
+  unassigned incident to you (Sentinel's owner field is the lock, and the write is
+  ETag-conditional), so two analysts can't both end up triaging the same incident:
+  if a colleague already owns it you get *ALREADY_ASSIGNED* with their name instead
+  of a duplicate investigation, and if it was AI-triaged in the last 30 minutes you
+  get *RECENTLY_TRIAGED* pointing at the existing findings. Add `force=true` to run
+  anyway (it never takes ownership away from anyone). Status changes and assignments
+  are ETag-protected too: a concurrent edit returns *CONFLICT* — re-read and retry.
 - Destructive tools (close/classify, remediation) ask the client to confirm first.
   Closing requires a classification. Identity actions (revoke sessions, disable
   account) are refused for delegated tenants without a per-customer Graph app —

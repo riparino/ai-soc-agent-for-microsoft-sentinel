@@ -233,11 +233,18 @@ async def test_triage_then_fetch_report(server):
         contoso = await _call(session, "sentinel_list_incidents", workspace="contoso")
         ref = contoso["incidents"][0]["id"]
         before = await _call(session, "sentinel_get_triage_report", incident_ref=ref)
-        report = await _call(session, "sentinel_triage_incident", incident_ref=ref)
+        # Other tests may already have triaged this seeded incident (mock state is
+        # process-global), so force past the claim/dedupe guard for the first run...
+        report = await _call(session, "sentinel_triage_incident", incident_ref=ref, force=True)
         after = await _call(session, "sentinel_get_triage_report", incident_ref=ref)
+        # ...and the very next plain run must be deduplicated, not repeated.
+        rerun = await _call(session, "sentinel_triage_incident", incident_ref=ref)
     assert before.get("status") == "NOT_TRIAGED" or "verdict" in before
     assert report["verdict"] in {"TRUE_POSITIVE", "FALSE_POSITIVE", "SUSPICIOUS_ESCALATE"}
+    assert report["coordination"]["claim_requested"] is True
     assert after["verdict"] == report["verdict"]
+    assert rerun["status"] == "RECENTLY_TRIAGED"
+    assert rerun["incident_ref"] == ref
 
 
 # ---------------------------------------------------------------- actions

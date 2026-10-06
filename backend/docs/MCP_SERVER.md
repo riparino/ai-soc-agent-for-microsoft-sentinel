@@ -31,7 +31,7 @@ call routes to the right delegated tenant. Always get refs from
 | `sentinel_get_incident` | read | Full entity graph, alerts, comments, classification |
 | `sentinel_extract_indicators` | read | Flat, deduped IOC lists (ips, hosts, accounts, hashes, urls, azure_resources…) for hand-off to intel / asset tools |
 | `sentinel_list_tenant_users` | read | Assignees for a workspace's tenant (Graph or SigninLogs per `graph_mode`) |
-| `sentinel_triage_incident` | write | Run the autonomous investigation → verdict, MITRE, evidence, RCA (posts summary comment if enabled) |
+| `sentinel_triage_incident` | write | Claims the incident for the analyst (if unassigned), then runs the investigation → verdict, MITRE, evidence, RCA; returns `ALREADY_ASSIGNED` / `RECENTLY_TRIAGED` instead of duplicating work (`force` to override) |
 | `sentinel_get_triage_report` | read | Fetch an existing report |
 | `sentinel_run_kql` | read | KQL against a workspace's Log Analytics (Lighthouse-delegated) |
 | `sentinel_check_ip_reputation` / `sentinel_check_file_hash` | read | Threat-intel lookups |
@@ -231,6 +231,13 @@ Secret as the web app with that `command`, and expose it on your ingress under
 - **Flat schemas**: optional parameters use `""` / `0` / `[]` / `{}` to mean
   "not set" rather than nullable types, so tools survive import into Copilot Studio
   (which filters `$ref` inputs and truncates `type` arrays / nullable unions).
+- **No races between analysts**: Sentinel's incident *owner* is the coordination
+  lock. Triage claims unassigned incidents with an ETag-conditional assignment and
+  refuses incidents owned by someone else; `sentinel_update_incident_status` and
+  `sentinel_assign_incident` send `If-Match`, so a concurrent change returns
+  `CONFLICT` rather than overwriting it. This works across every analyst's local
+  server and the Sentinel/Defender portals because the state lives in Sentinel, not
+  in any one process. Tune with `TRIAGE_CLAIM_ON_RUN` / `TRIAGE_DEDUPE_MINUTES`.
 - **Shared state**: the triage report cache is process-local (same as the web
   app). Reports produced over MCP are visible in the web UI only when both run in
   the same process; for multi-replica deployments back the store with Redis/Postgres.
