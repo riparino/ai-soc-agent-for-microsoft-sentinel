@@ -1,6 +1,6 @@
 # 🛡️ Microsoft Sentinel AI SOC Agent — Local Analyst MCP Server
 
-> **You are on `analyst-local`, the default branch.** It holds the version each
+> **You are on `analyst-local`.** It holds the version each
 > analyst runs **on their own machine**: an MCP server that plugs Microsoft Sentinel
 > — across every customer workspace delegated to you via Azure Lighthouse — into
 > Claude Desktop, Claude Code or VS Code. It authenticates as the signed-in analyst
@@ -23,8 +23,8 @@
 >
 > | Branch | Purpose |
 > |--------|---------|
-> | `analyst-local` (default) | Per-analyst local MCP server — this branch. Also contains the shared backend (fleet registry, Sentinel/KQL clients) and the Copilot Studio-ready MCP server. |
-> | `web-console` (formerly `main`) | The hosted web SOC console (FastAPI + React) for a shared deployment; the multi-tenant re-architecture PR lands here. |
+> | `analyst-local` | Per-analyst local MCP server — this branch. Also contains the shared backend (fleet registry, Sentinel/KQL clients) and the Copilot Studio-ready MCP server. |
+> | `main` | The hosted web SOC console (FastAPI + React) for a shared deployment; the multi-tenant re-architecture PR (#1) lands here. |
 > | `claude/*` | Working branches behind the pull requests; not for direct use. |
 
 ---

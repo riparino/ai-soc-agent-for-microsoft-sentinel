@@ -2,9 +2,9 @@
 
 on:
   push:
-    branches: [ analyst-local, web-console, main ]
+    branches: [ analyst-local, main ]
   pull_request:
-    branches: [ analyst-local, web-console, main ]
+    branches: [ analyst-local, main ]
 
 jobs:
   backend-test-and-lint:
