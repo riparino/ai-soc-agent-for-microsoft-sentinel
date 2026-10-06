@@ -23,6 +23,12 @@ can discover the authorization server).
 Workspace/tenant context travels inside the namespaced incident ref
 (``<workspace_id>::<incident_guid>``) exactly as it does in the REST API, so every
 tool routes to the correct delegated Sentinel workspace automatically.
+
+Schema compatibility: tool parameters deliberately use plain, non-nullable types
+with "empty means unset" defaults (``""``, ``0``, ``[]``, ``{}``) instead of
+``Optional[...]``. Copilot Studio maps MCP schemas onto Power Platform connector
+schemas and filters/truncates tools whose inputs use ``$ref``, ``type`` arrays or
+nullable unions, so keeping schemas flat keeps every tool usable there.
 """
 
 from __future__ import annotations
@@ -31,7 +37,7 @@ import argparse
 import logging
 import sys
 import time
-from typing import Annotated, Any, Optional
+from typing import Annotated, Any, Callable, Optional
 
 import httpx
 from pydantic import AnyHttpUrl, Field
@@ -58,9 +64,13 @@ SERVER_INSTRUCTIONS = (
     "(Azure Lighthouse) workspaces. Incident IDs are namespaced refs of the form "
     f"'<workspace_id>{WORKSPACE_REF_SEPARATOR}<incident_guid>'; always obtain refs from "
     "sentinel_list_incidents or sentinel_get_incident rather than guessing them. "
-    "Start with sentinel_list_workspaces to see the fleet. Identity actions (revoke "
-    "sessions / disable account) are refused for delegated tenants without a per-customer "
-    "Microsoft Graph app because Azure Lighthouse does not delegate Microsoft Graph."
+    "Start with sentinel_list_workspaces to see the fleet. Use sentinel_extract_indicators "
+    "to get an incident's IPs, hosts, accounts and hashes as flat lists for enrichment "
+    "with other tools (threat intelligence, asset/cloud inventory), then record findings "
+    "with sentinel_add_comment. Identity actions (revoke sessions / disable account) are "
+    "refused for delegated tenants without a per-customer Microsoft Graph app because "
+    "Azure Lighthouse does not delegate Microsoft Graph. Optional parameters use empty "
+    "values ('' / 0 / []) to mean 'not set'."
 )
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
@@ -73,6 +83,8 @@ INCIDENT_SUMMARY_FIELDS = (
     "lastModifiedTimeUtc", "workspaceId", "workspaceName", "workspaceTenantId",
     "assignedTo", "tactics", "classification", "alertsCount", "labels",
 )
+
+REF_DESCRIPTION = f"Namespaced incident ref '<workspace_id>{WORKSPACE_REF_SEPARATOR}<incident_guid>' from sentinel_list_incidents."
 
 
 # --------------------------------------------------------------------------- auth
@@ -209,9 +221,10 @@ def _build_auth(auth_mode: str) -> tuple[Optional[EntraTokenVerifier], Optional[
 
 # ------------------------------------------------------------------- server
 def create_server(auth_mode: Optional[str] = None, host: Optional[str] = None, port: Optional[int] = None) -> FastMCP:
-    """Create the FastMCP server with all tools registered.
+    """Create the FastMCP server with all (non-disabled) tools registered.
 
     ``auth_mode`` overrides ``settings.MCP_AUTH_MODE`` (``none`` | ``entra``).
+    Tools named in ``settings.MCP_DISABLED_TOOLS`` are not registered.
     """
     mode = (auth_mode or settings.MCP_AUTH_MODE or "none").lower()
     verifier, auth = _build_auth(mode)
@@ -226,7 +239,10 @@ def create_server(auth_mode: Optional[str] = None, host: Optional[str] = None, p
         stateless_http=True,
         json_response=True,
     )
-    _register_tools(mcp)
+    disabled = set(_split_csv(settings.MCP_DISABLED_TOOLS))
+    if disabled:
+        logger.info("MCP: not registering disabled tools: %s", ", ".join(sorted(disabled)))
+    _register_tools(mcp, disabled)
     return mcp
 
 
@@ -249,7 +265,83 @@ def _not_found(incident_ref: str) -> dict[str, Any]:
     }
 
 
-def _register_tools(mcp: FastMCP) -> None:
+def _opt(value: str) -> Optional[str]:
+    """Flat-schema optional: '' means not set."""
+    value = (value or "").strip()
+    return value or None
+
+
+def _dedupe(values: list[Any]) -> list[Any]:
+    seen: set[str] = set()
+    out: list[Any] = []
+    for v in values:
+        if v is None or v == "":
+            continue
+        key = str(v).lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(v)
+    return out
+
+
+def extract_indicators(incident: dict[str, Any]) -> dict[str, Any]:
+    """Flatten an incident's entity graph into per-type indicator lists.
+
+    Designed for hand-off to other tools (threat-intel enrichment of IPs/hashes,
+    asset or cloud-inventory lookups of hosts/resources), so every list is deduped
+    and contains plain strings.
+    """
+    ips: list[str] = []
+    accounts: list[str] = []
+    hosts: list[str] = []
+    hashes: list[str] = []
+    urls: list[str] = []
+    resources: list[str] = []
+    processes: list[str] = []
+    cloud_apps: list[str] = []
+    mailboxes: list[str] = []
+
+    for e in incident.get("entities") or []:
+        kind = str(e.get("kind", "")).lower()
+        if kind == "ip":
+            ips.append(e.get("address"))
+        elif kind == "account":
+            accounts.append(e.get("upn") or e.get("name"))
+        elif kind == "host":
+            hosts.append(e.get("name"))
+        elif kind == "filehash":
+            hashes.append(e.get("sha256") or e.get("name"))
+        elif kind == "url":
+            urls.append(e.get("url") or e.get("name"))
+        elif kind == "azureresource":
+            resources.append(e.get("resourceId") or e.get("name"))
+        elif kind == "process":
+            processes.append(e.get("commandLine") or e.get("processName"))
+        elif kind == "cloudapplication":
+            cloud_apps.append(e.get("name"))
+        elif kind == "mailbox":
+            mailboxes.append(e.get("name"))
+
+    # Hosts referenced by Azure resource IDs are also useful asset keys.
+    result = {
+        "incident_ref": incident.get("id"),
+        "workspace_id": incident.get("workspaceId"),
+        "workspace_name": incident.get("workspaceName"),
+        "ips": _dedupe(ips),
+        "accounts": _dedupe(accounts),
+        "hosts": _dedupe(hosts),
+        "file_hashes": _dedupe(hashes),
+        "urls": _dedupe(urls),
+        "azure_resources": _dedupe(resources),
+        "processes": _dedupe(processes),
+        "cloud_apps": _dedupe(cloud_apps),
+        "mailboxes": _dedupe(mailboxes),
+    }
+    result["counts"] = {k: len(v) for k, v in result.items() if isinstance(v, list)}
+    return result
+
+
+def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
     # Imported here so creating the server module doesn't eagerly construct every
     # service at import time (keeps `--help` fast and stdio startup quiet).
     from app.services.sentinel_client import sentinel_client
@@ -263,8 +355,14 @@ def _register_tools(mcp: FastMCP) -> None:
     # the protocol channel).
     from app.services.triage_store import TRIAGE_REPORTS_CACHE
 
+    def tool(name: str, **kwargs: Any) -> Callable[[Callable], Callable]:
+        """Register with FastMCP unless the tool is disabled by configuration."""
+        if name in disabled:
+            return lambda fn: fn
+        return mcp.tool(name=name, **kwargs)
+
     # ---------------------------------------------------------------- fleet
-    @mcp.tool(name="sentinel_list_workspaces", title="List Sentinel workspaces", annotations=READ_ONLY)
+    @tool("sentinel_list_workspaces", title="List Sentinel workspaces", annotations=READ_ONLY)
     async def sentinel_list_workspaces() -> dict[str, Any]:
         """List the managed Microsoft Sentinel workspace fleet (one entry per customer tenant).
 
@@ -278,12 +376,12 @@ def _register_tools(mcp: FastMCP) -> None:
         return {"count": len(workspaces), "workspaces": workspaces}
 
     # ------------------------------------------------------------ incidents
-    @mcp.tool(name="sentinel_list_incidents", title="List Sentinel incidents", annotations=READ_ONLY)
+    @tool("sentinel_list_incidents", title="List Sentinel incidents", annotations=READ_ONLY)
     async def sentinel_list_incidents(
         workspace: Annotated[str, Field(description="Workspace id from sentinel_list_workspaces, a comma-separated list of ids, or 'all' to aggregate the whole fleet.")] = "all",
-        status: Annotated[Optional[str], Field(description="Filter by status: New, Active, or Closed.")] = None,
-        severity: Annotated[Optional[str], Field(description="Filter by severity: High, Medium, Low, or Informational.")] = None,
-        days: Annotated[Optional[int], Field(description="Only incidents created in the last N days.", ge=1, le=365)] = None,
+        status: Annotated[str, Field(description="Filter by status: New, Active, or Closed. Empty = any status.")] = "",
+        severity: Annotated[str, Field(description="Filter by severity: High, Medium, Low, or Informational. Empty = any severity.")] = "",
+        days: Annotated[int, Field(description="Only incidents created in the last N days. 0 = no time filter.", ge=0, le=365)] = 0,
         limit: Annotated[int, Field(description="Maximum incidents to return (newest first).", ge=1, le=200)] = 25,
     ) -> dict[str, Any]:
         """List incidents across one, several, or all managed Sentinel workspaces.
@@ -294,12 +392,13 @@ def _register_tools(mcp: FastMCP) -> None:
         sentinel_get_incident for the full entity graph, alerts, and comments.
         """
         incidents = await sentinel_client.list_incidents(
-            filter_status=status, severity=severity, time_range_days=days, workspace=workspace
+            filter_status=_opt(status), severity=_opt(severity), time_range_days=days or None, workspace=workspace
         )
         page = incidents[:limit]
         per_workspace: dict[str, int] = {}
         for inc in incidents:
-            per_workspace[inc.get("workspaceId", "unknown")] = per_workspace.get(inc.get("workspaceId", "unknown"), 0) + 1
+            wid = inc.get("workspaceId", "unknown")
+            per_workspace[wid] = per_workspace.get(wid, 0) + 1
         return {
             "total": len(incidents),
             "count": len(page),
@@ -309,9 +408,9 @@ def _register_tools(mcp: FastMCP) -> None:
             "incidents": [_summarize(i) for i in page],
         }
 
-    @mcp.tool(name="sentinel_get_incident", title="Get Sentinel incident", annotations=READ_ONLY)
+    @tool("sentinel_get_incident", title="Get Sentinel incident", annotations=READ_ONLY)
     async def sentinel_get_incident(
-        incident_ref: Annotated[str, Field(description="Namespaced incident ref '<workspace_id>::<incident_guid>' from sentinel_list_incidents.", min_length=1)],
+        incident_ref: Annotated[str, Field(description=REF_DESCRIPTION, min_length=1)],
     ) -> dict[str, Any]:
         """Get one incident with its full entity graph (accounts, IPs, hosts, processes,
         hashes), correlated alerts, comments, labels, and classification.
@@ -321,9 +420,27 @@ def _register_tools(mcp: FastMCP) -> None:
         incident = await sentinel_client.get_incident(incident_ref)
         return incident or _not_found(incident_ref)
 
-    @mcp.tool(name="sentinel_list_tenant_users", title="List tenant users for assignment", annotations=READ_ONLY)
+    @tool("sentinel_extract_indicators", title="Extract incident indicators", annotations=READ_ONLY)
+    async def sentinel_extract_indicators(
+        incident_ref: Annotated[str, Field(description=REF_DESCRIPTION, min_length=1)],
+    ) -> dict[str, Any]:
+        """Return an incident's indicators as flat, deduplicated lists: ``ips``,
+        ``accounts``, ``hosts``, ``file_hashes``, ``urls``, ``azure_resources``,
+        ``processes``, ``cloud_apps``, ``mailboxes`` (plus ``counts``).
+
+        Use this to hand indicators to other tools — e.g. enrich ``ips``/``file_hashes``/
+        ``urls`` with a threat-intelligence service, or look up ``hosts``/``azure_resources``
+        in an asset or cloud-security inventory — then record findings on the incident
+        with sentinel_add_comment.
+        """
+        incident = await sentinel_client.get_incident(incident_ref)
+        if not incident:
+            return _not_found(incident_ref)
+        return extract_indicators(incident)
+
+    @tool("sentinel_list_tenant_users", title="List tenant users for assignment", annotations=READ_ONLY)
     async def sentinel_list_tenant_users(
-        workspace: Annotated[Optional[str], Field(description="Workspace id whose tenant directory to list. Defaults to the managing tenant.")] = None,
+        workspace: Annotated[str, Field(description="Workspace id whose tenant directory to list. Empty = the managing tenant.")] = "",
     ) -> dict[str, Any]:
         """List SOC engineers / users for a workspace's tenant, for use with
         sentinel_assign_incident.
@@ -332,7 +449,7 @@ def _register_tools(mcp: FastMCP) -> None:
         tenant or a per-customer app; otherwise the workspace's own SigninLogs telemetry
         (Azure Lighthouse does not delegate Microsoft Graph).
         """
-        ws = workspace_registry.get(workspace) if workspace else None
+        ws = workspace_registry.get(_opt(workspace)) if _opt(workspace) else None
         users = await sentinel_client.get_entra_users(workspace=ws)
         resolved = ws or workspace_registry.managing_workspace() or workspace_registry.default()
         return {
@@ -343,9 +460,9 @@ def _register_tools(mcp: FastMCP) -> None:
         }
 
     # --------------------------------------------------------------- triage
-    @mcp.tool(name="sentinel_triage_incident", title="Run AI triage on an incident", annotations=WRITE_SAFE)
+    @tool("sentinel_triage_incident", title="Run AI triage on an incident", annotations=WRITE_SAFE)
     async def sentinel_triage_incident(
-        incident_ref: Annotated[str, Field(description="Namespaced incident ref '<workspace_id>::<incident_guid>'.", min_length=1)],
+        incident_ref: Annotated[str, Field(description=REF_DESCRIPTION, min_length=1)],
     ) -> dict[str, Any]:
         """Run the autonomous triage investigation on an incident and return the report.
 
@@ -363,9 +480,9 @@ def _register_tools(mcp: FastMCP) -> None:
         TRIAGE_REPORTS_CACHE[incident["id"]] = report
         return report
 
-    @mcp.tool(name="sentinel_get_triage_report", title="Get existing triage report", annotations=READ_ONLY)
+    @tool("sentinel_get_triage_report", title="Get existing triage report", annotations=READ_ONLY)
     async def sentinel_get_triage_report(
-        incident_ref: Annotated[str, Field(description="Namespaced incident ref '<workspace_id>::<incident_guid>'.", min_length=1)],
+        incident_ref: Annotated[str, Field(description=REF_DESCRIPTION, min_length=1)],
     ) -> dict[str, Any]:
         """Return a previously generated triage report for an incident, if one exists.
 
@@ -380,10 +497,10 @@ def _register_tools(mcp: FastMCP) -> None:
         return {"status": "NOT_TRIAGED", "incident_ref": canonical, "hint": "Run sentinel_triage_incident to generate a report."}
 
     # ------------------------------------------------------------ hunting/TI
-    @mcp.tool(name="sentinel_run_kql", title="Run KQL query", annotations=READ_ONLY_EXTERNAL)
+    @tool("sentinel_run_kql", title="Run KQL query", annotations=READ_ONLY_EXTERNAL)
     async def sentinel_run_kql(
         query: Annotated[str, Field(description="Kusto Query Language query, e.g. \"SigninLogs | where ResultType != 0 | take 20\".", min_length=1)],
-        workspace: Annotated[Optional[str], Field(description="Workspace id to query. Defaults to the default workspace. Use the incident's workspaceId when hunting for a specific incident.")] = None,
+        workspace: Annotated[str, Field(description="Workspace id to query. Empty = the default workspace. Use the incident's workspaceId when hunting for a specific incident.")] = "",
         timespan_hours: Annotated[int, Field(description="Lookback window in hours.", ge=1, le=24 * 90)] = 24,
     ) -> dict[str, Any]:
         """Execute a KQL query against a workspace's Log Analytics data (SigninLogs,
@@ -392,56 +509,60 @@ def _register_tools(mcp: FastMCP) -> None:
         Works across delegated tenants via Azure Lighthouse. Returns tables with columns,
         rows, row counts, latency, and the data source (live vs. simulated in demo mode).
         """
-        ws = workspace_registry.get(workspace) if workspace else None
-        if workspace and ws is None:
-            return {"error": "WORKSPACE_NOT_FOUND", "workspace": workspace, "hint": "Use sentinel_list_workspaces for valid ids."}
+        ws_id = _opt(workspace)
+        ws = workspace_registry.get(ws_id) if ws_id else None
+        if ws_id and ws is None:
+            return {"error": "WORKSPACE_NOT_FOUND", "workspace": ws_id, "hint": "Use sentinel_list_workspaces for valid ids."}
         return await kql_runner.execute_kql(query, timespan_hours=timespan_hours, workspace=ws)
 
-    @mcp.tool(name="sentinel_check_ip_reputation", title="Check IP reputation", annotations=READ_ONLY_EXTERNAL)
+    @tool("sentinel_check_ip_reputation", title="Check IP reputation", annotations=READ_ONLY_EXTERNAL)
     async def sentinel_check_ip_reputation(
         ip_address: Annotated[str, Field(description="IPv4 or IPv6 address to look up.", min_length=3)],
     ) -> dict[str, Any]:
         """Look up an IP address against threat-intelligence feeds (AbuseIPDB and global
         feeds). Returns an abuse confidence score, verdict (MALICIOUS / SUSPICIOUS /
-        BENIGN_INTERNAL / …), and context such as ISP and country."""
+        BENIGN_INTERNAL / …), and context such as ISP and country. If a dedicated
+        threat-intelligence tool is available to you, prefer it and use this as a fallback."""
         return await threat_intel_service.lookup_ip_reputation(ip_address)
 
-    @mcp.tool(name="sentinel_check_file_hash", title="Check file hash", annotations=READ_ONLY_EXTERNAL)
+    @tool("sentinel_check_file_hash", title="Check file hash", annotations=READ_ONLY_EXTERNAL)
     async def sentinel_check_file_hash(
         file_hash: Annotated[str, Field(description="SHA256, SHA1, or MD5 hash.", min_length=32)],
     ) -> dict[str, Any]:
         """Look up a file hash against VirusTotal-style threat databases and return
-        detection counts and a verdict."""
+        detection counts and a verdict. If a dedicated threat-intelligence tool is
+        available to you, prefer it and use this as a fallback."""
         return await threat_intel_service.lookup_file_hash(file_hash)
 
     # ---------------------------------------------------------------- actions
-    @mcp.tool(name="sentinel_add_comment", title="Add incident comment", annotations=WRITE_SAFE)
+    @tool("sentinel_add_comment", title="Add incident comment", annotations=WRITE_SAFE)
     async def sentinel_add_comment(
-        incident_ref: Annotated[str, Field(description="Namespaced incident ref '<workspace_id>::<incident_guid>'.", min_length=1)],
+        incident_ref: Annotated[str, Field(description=REF_DESCRIPTION, min_length=1)],
         message: Annotated[str, Field(description="Markdown comment to post on the incident.", min_length=1, max_length=20000)],
         author: Annotated[str, Field(description="Author label recorded with the comment.")] = "AI SOC Agent (MCP)",
     ) -> dict[str, Any]:
         """Post an investigation note / comment to the incident in its own Sentinel
-        workspace. Non-destructive; the comment is appended to the incident's timeline."""
+        workspace — e.g. enrichment results from other tools. Non-destructive; the
+        comment is appended to the incident's timeline."""
         result = await sentinel_client.add_comment(incident_ref, message, author=author)
         return result if result.get("status") != "NOT_FOUND" else _not_found(incident_ref)
 
-    @mcp.tool(name="sentinel_update_incident_status", title="Update incident status / classification", annotations=WRITE_DESTRUCTIVE)
+    @tool("sentinel_update_incident_status", title="Update incident status / classification", annotations=WRITE_DESTRUCTIVE)
     async def sentinel_update_incident_status(
-        incident_ref: Annotated[str, Field(description="Namespaced incident ref '<workspace_id>::<incident_guid>'.", min_length=1)],
+        incident_ref: Annotated[str, Field(description=REF_DESCRIPTION, min_length=1)],
         status: Annotated[str, Field(description="New status: New, Active, or Closed.", pattern="^(New|Active|Closed)$")],
-        severity: Annotated[Optional[str], Field(description="Optionally adjust severity: High, Medium, Low, Informational.")] = None,
-        classification: Annotated[Optional[str], Field(description="Required when closing: TruePositive, FalsePositive, BenignPositive, or Undetermined.")] = None,
-        classification_reason: Annotated[Optional[str], Field(description="Sentinel classification reason, e.g. SuspiciousActivity, InaccurateData, SuspiciousButExpected.")] = None,
-        classification_comment: Annotated[Optional[str], Field(description="Closing notes recorded on the incident.")] = None,
-        labels: Annotated[Optional[list[str]], Field(description="Labels/tags to apply to the incident.")] = None,
+        severity: Annotated[str, Field(description="Optionally adjust severity: High, Medium, Low, Informational. Empty = unchanged.")] = "",
+        classification: Annotated[str, Field(description="Required when closing: TruePositive, FalsePositive, BenignPositive, or Undetermined. Empty = unchanged.")] = "",
+        classification_reason: Annotated[str, Field(description="Sentinel classification reason, e.g. SuspiciousActivity, InaccurateData, SuspiciousButExpected. Empty = default for the classification.")] = "",
+        classification_comment: Annotated[str, Field(description="Closing notes recorded on the incident. Empty = default note.")] = "",
+        labels: Annotated[list[str], Field(description="Labels/tags to apply to the incident. Empty list = unchanged.")] = [],
         updated_by: Annotated[str, Field(description="Analyst / agent name recorded in the audit comment.")] = "AI SOC Agent (MCP)",
     ) -> dict[str, Any]:
         """Change an incident's status, severity, classification, or labels in its Sentinel
         workspace. Closing an incident is a significant action: confirm with the analyst
         first and always supply a ``classification`` (and ideally a reason/comment). An
         audit comment is posted automatically."""
-        if status == "Closed" and not classification:
+        if status == "Closed" and not _opt(classification):
             return {
                 "error": "CLASSIFICATION_REQUIRED",
                 "hint": "Closing requires classification: TruePositive, FalsePositive, BenignPositive, or Undetermined.",
@@ -449,44 +570,44 @@ def _register_tools(mcp: FastMCP) -> None:
         result = await sentinel_client.update_status(
             incident_ref,
             status=status,
-            severity=severity,
-            classification=classification,
-            classification_reason=classification_reason,
-            classification_comment=classification_comment,
-            labels=labels,
+            severity=_opt(severity),
+            classification=_opt(classification),
+            classification_reason=_opt(classification_reason),
+            classification_comment=_opt(classification_comment),
+            labels=list(labels) or None,
             updated_by=updated_by,
         )
         return result if result.get("status") != "NOT_FOUND" else _not_found(incident_ref)
 
-    @mcp.tool(name="sentinel_assign_incident", title="Assign incident", annotations=WRITE_SAFE)
+    @tool("sentinel_assign_incident", title="Assign incident", annotations=WRITE_SAFE)
     async def sentinel_assign_incident(
-        incident_ref: Annotated[str, Field(description="Namespaced incident ref '<workspace_id>::<incident_guid>'.", min_length=1)],
-        user_upn: Annotated[Optional[str], Field(description="UPN/email of the assignee (from sentinel_list_tenant_users). Omit all user fields to unassign.")] = None,
-        user_name: Annotated[Optional[str], Field(description="Display name of the assignee.")] = None,
-        user_id: Annotated[Optional[str], Field(description="Entra object id of the assignee, if known.")] = None,
+        incident_ref: Annotated[str, Field(description=REF_DESCRIPTION, min_length=1)],
+        user_upn: Annotated[str, Field(description="UPN/email of the assignee (from sentinel_list_tenant_users). Leave all user fields empty to unassign.")] = "",
+        user_name: Annotated[str, Field(description="Display name of the assignee.")] = "",
+        user_id: Annotated[str, Field(description="Entra object id of the assignee, if known.")] = "",
         assigned_by: Annotated[str, Field(description="Who performed the assignment (audit comment).")] = "AI SOC Agent (MCP)",
     ) -> dict[str, Any]:
-        """Assign an incident to a SOC engineer in its tenant, or unassign it when no user
-        fields are given. Posts an audit comment on the incident."""
+        """Assign an incident to a SOC engineer in its tenant, or unassign it when all user
+        fields are empty. Posts an audit comment on the incident."""
         result = await sentinel_client.assign_incident(
             incident_ref,
-            user_id=user_id,
-            user_name=user_name,
-            user_email=user_upn,
-            user_upn=user_upn,
+            user_id=_opt(user_id),
+            user_name=_opt(user_name),
+            user_email=_opt(user_upn),
+            user_upn=_opt(user_upn),
             assigned_by=assigned_by,
         )
         return result if result.get("status") != "NOT_FOUND" else _not_found(incident_ref)
 
-    @mcp.tool(name="sentinel_remediate_incident", title="Execute remediation action", annotations=WRITE_DESTRUCTIVE)
+    @tool("sentinel_remediate_incident", title="Execute remediation action", annotations=WRITE_DESTRUCTIVE)
     async def sentinel_remediate_incident(
-        incident_ref: Annotated[str, Field(description="Namespaced incident ref '<workspace_id>::<incident_guid>'.", min_length=1)],
+        incident_ref: Annotated[str, Field(description=REF_DESCRIPTION, min_length=1)],
         action_type: Annotated[str, Field(
             description="One of: isolate_endpoint, block_ip, trigger_playbook, close_false_positive, revoke_sessions, disable_account.",
             pattern="^(isolate_endpoint|block_ip|trigger_playbook|close_false_positive|revoke_sessions|disable_account)$",
         )],
         entity: Annotated[str, Field(description="Target entity: device name, IP address, or user UPN depending on the action.", min_length=1)],
-        parameters: Annotated[Optional[dict[str, Any]], Field(description="Action parameters, e.g. {\"playbook_name\": \"...\"} or {\"reason\": \"...\"}.")] = None,
+        parameters: Annotated[dict[str, Any], Field(description="Action parameters, e.g. {\"playbook_name\": \"...\"} or {\"reason\": \"...\"}. Empty object = defaults.")] = {},
         analyst_name: Annotated[str, Field(description="Analyst / agent executing the action (audit trail).")] = "AI SOC Agent (MCP)",
     ) -> dict[str, Any]:
         """Execute a containment / remediation action for an incident and record an audit
@@ -505,7 +626,7 @@ def _register_tools(mcp: FastMCP) -> None:
             action_type=action_type,
             entity=entity,
             analyst_name=analyst_name,
-            parameters=parameters,
+            parameters=dict(parameters) or None,
         )
 
 

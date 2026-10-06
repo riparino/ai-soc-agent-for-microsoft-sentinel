@@ -23,6 +23,7 @@ EXPECTED_TOOLS = {
     "sentinel_list_workspaces",
     "sentinel_list_incidents",
     "sentinel_get_incident",
+    "sentinel_extract_indicators",
     "sentinel_list_tenant_users",
     "sentinel_triage_incident",
     "sentinel_get_triage_report",
@@ -40,8 +41,78 @@ EXPECTED_TOOLS = {
 def _demo_registry():
     settings.WORKSPACES_JSON = None
     settings.WORKSPACES_CONFIG_PATH = None
+    settings.MCP_DISABLED_TOOLS = None
     workspace_registry.reload()
     yield
+    settings.MCP_DISABLED_TOOLS = None
+
+
+# ------------------------------------------------------ Copilot Studio compat
+def _walk(node, found):
+    """Collect JSON-schema constructs Copilot Studio can't consume."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k in ("$ref", "$defs", "anyOf", "oneOf", "exclusiveMinimum", "exclusiveMaximum"):
+                found.append(k)
+            if k == "type" and isinstance(v, list):
+                found.append("type-array")
+            _walk(v, found)
+    elif isinstance(node, list):
+        for v in node:
+            _walk(v, found)
+
+
+@pytest.mark.asyncio
+async def test_schemas_are_flat_for_copilot_studio(server):
+    """Copilot Studio filters tools with $ref inputs and truncates schemas with type
+    arrays / nullable unions; every tool must stay flat so none get dropped there."""
+    async with create_connected_server_and_client_session(server) as session:
+        tools = (await session.list_tools()).tools
+    offenders = {}
+    for t in tools:
+        found = []
+        _walk(t.inputSchema, found)
+        if found:
+            offenders[t.name] = found
+    assert offenders == {}, f"non-flat input schemas: {offenders}"
+
+
+def test_disabled_tools_are_not_registered(monkeypatch):
+    """MCP_DISABLED_TOOLS trims the tool set (e.g. when another MCP server in the
+    agent already provides threat intel)."""
+    import asyncio
+
+    monkeypatch.setattr(settings, "MCP_DISABLED_TOOLS", "sentinel_check_ip_reputation, sentinel_check_file_hash")
+    names = {t.name for t in asyncio.run(create_server(auth_mode="none").list_tools())}
+    assert names == EXPECTED_TOOLS - {"sentinel_check_ip_reputation", "sentinel_check_file_hash"}
+
+
+@pytest.mark.asyncio
+async def test_extract_indicators_flattens_entities(server):
+    async with create_connected_server_and_client_session(server) as session:
+        contoso = await _call(session, "sentinel_list_incidents", workspace="contoso")
+        ref = contoso["incidents"][0]["id"]
+        inc = await _call(session, "sentinel_get_incident", incident_ref=ref)
+        ind = await _call(session, "sentinel_extract_indicators", incident_ref=ref)
+        missing = await _call(session, "sentinel_extract_indicators", incident_ref="contoso::nope")
+    assert ind["incident_ref"] == ref and ind["workspace_id"] == "contoso"
+    expected_ips = {e["address"] for e in inc["entities"] if e.get("kind") == "Ip"}
+    assert set(ind["ips"]) == expected_ips
+    assert all(isinstance(v, str) for v in ind["ips"] + ind["accounts"] + ind["hosts"])
+    assert ind["counts"]["ips"] == len(ind["ips"])
+    assert missing["error"] == "INCIDENT_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_empty_optionals_mean_unset(server):
+    """Flat-schema convention: '' / 0 behave exactly like omitted parameters."""
+    async with create_connected_server_and_client_session(server) as session:
+        implicit = await _call(session, "sentinel_list_incidents", workspace="all")
+        explicit = await _call(session, "sentinel_list_incidents", workspace="all", status="", severity="", days=0)
+        filtered = await _call(session, "sentinel_list_incidents", workspace="all", severity="High")
+    assert {i["id"] for i in implicit["incidents"]} == {i["id"] for i in explicit["incidents"]}
+    assert 0 < filtered["total"] <= implicit["total"]
+    assert all(i["severity"] == "High" for i in filtered["incidents"])
 
 
 @pytest.fixture

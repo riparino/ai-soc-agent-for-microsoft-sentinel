@@ -29,6 +29,7 @@ call routes to the right delegated tenant. Always get refs from
 | `sentinel_list_workspaces` | read | The fleet: ids (use as `workspace` selector), coordinates, `graph_mode` |
 | `sentinel_list_incidents` | read | Compact summaries across one / several / `all` workspaces; filters + `limit` |
 | `sentinel_get_incident` | read | Full entity graph, alerts, comments, classification |
+| `sentinel_extract_indicators` | read | Flat, deduped IOC lists (ips, hosts, accounts, hashes, urls, azure_resources…) for hand-off to intel / asset tools |
 | `sentinel_list_tenant_users` | read | Assignees for a workspace's tenant (Graph or SigninLogs per `graph_mode`) |
 | `sentinel_triage_incident` | write | Run the autonomous investigation → verdict, MITRE, evidence, RCA (posts summary comment if enabled) |
 | `sentinel_get_triage_report` | read | Fetch an existing report |
@@ -179,10 +180,11 @@ Put it behind HTTPS (ingress / App Gateway / Container Apps). The server:
 
 ### 3. Connect clients
 
-- **Copilot Studio** — in your agent, *Tools → Add a tool → Model Context Protocol*,
-  enter the server URL and configure OAuth 2.0 against Entra (client app
-  registration with the Copilot Studio redirect URI, scope `api://<id>/Sentinel.Triage`).
-  Publish the agent to **Teams** to give the SOC a `@SOC Agent` in-channel.
+- **Copilot Studio** — add it to an existing agent with the MCP onboarding wizard
+  (OAuth 2.0 → Manual against Entra), optionally disabling overlapping tools via
+  `MCP_DISABLED_TOOLS`, then publish to **Teams**. Step-by-step, including the
+  Entra app registrations and a cross-tool (intel + cloud inventory) workflow:
+  **[COPILOT_STUDIO.md](COPILOT_STUDIO.md)**.
 - **Claude Enterprise** — an org admin adds the server URL as a **custom connector**
   with OAuth client credentials from a client app registration (redirect URI per
   Anthropic's connector docs). Analysts then use the tools in claude.ai / desktop.
@@ -205,6 +207,10 @@ sentinel-soc-mcp:
   env_file: ./backend/.env
   volumes:
     - ./backend/workspaces.json:/etc/sentinel/workspaces.json:ro
+  # The image's HEALTHCHECK probes the web app on :8000, which this container
+  # doesn't run; disable it so Compose doesn't mark the MCP service unhealthy.
+  healthcheck:
+    disable: true
 ```
 
 On AKS, add a second Deployment/Service using the same ConfigMap/Secret/fleet
@@ -213,6 +219,13 @@ Secret as the web app with that `command`, and expose it on your ingress under
 
 ## Notes and limits
 
+- **Trim the tool set**: `MCP_DISABLED_TOOLS="sentinel_check_ip_reputation,sentinel_check_file_hash"`
+  skips registering tools — useful when the consuming agent already has a dedicated
+  threat-intel server, and because Copilot Studio counts every MCP tool against the
+  agent's tool limit.
+- **Flat schemas**: optional parameters use `""` / `0` / `[]` / `{}` to mean
+  "not set" rather than nullable types, so tools survive import into Copilot Studio
+  (which filters `$ref` inputs and truncates `type` arrays / nullable unions).
 - **Shared state**: the triage report cache is process-local (same as the web
   app). Reports produced over MCP are visible in the web UI only when both run in
   the same process; for multi-replica deployments back the store with Redis/Postgres.

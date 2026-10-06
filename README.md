@@ -439,8 +439,15 @@ MCP_AUTH_MODE=entra ./run-mcp.sh --transport streamable-http --host 0.0.0.0   # 
   against your tenant's JWKS and the server publishes RFC 9728 protected‑resource
   metadata for client OAuth discovery.
 
+- **Plays well with other servers**: `sentinel_extract_indicators` hands an incident's
+  IPs/hosts/accounts/hashes to your threat‑intel and cloud‑inventory tools, and
+  `MCP_DISABLED_TOOLS` trims overlapping tools (schemas are kept flat so nothing is
+  dropped on import into Copilot Studio).
+
 👉 Setup for each client, Entra app registration, and deployment:
-[`backend/docs/MCP_SERVER.md`](backend/docs/MCP_SERVER.md).
+[`backend/docs/MCP_SERVER.md`](backend/docs/MCP_SERVER.md) · adding it to an existing
+Copilot Studio agent next to intel/cloud MCP servers:
+[`backend/docs/COPILOT_STUDIO.md`](backend/docs/COPILOT_STUDIO.md).
 
 ---
 

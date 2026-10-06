@@ -74,6 +74,11 @@ class Settings(BaseSettings):
     MCP_ENTRA_TENANT_ID: Optional[str] = None       # defaults to AZURE_TENANT_ID
     MCP_ENTRA_AUDIENCE: Optional[str] = None        # app (client) ID or api://<id>; comma-separated list allowed
     MCP_REQUIRED_SCOPES: Optional[str] = None       # comma-separated scp/roles that must be present, e.g. Sentinel.Triage
+    # Comma-separated tool names to NOT register. Keeps the tool count small when the
+    # consuming agent already has other MCP servers covering a capability (e.g. a
+    # Recorded Future server for threat intel), which matters because Copilot Studio
+    # counts every MCP tool against the agent's tool limit.
+    MCP_DISABLED_TOOLS: Optional[str] = None        # e.g. "sentinel_check_ip_reputation,sentinel_check_file_hash"
 
     # Auto-Triage & Polling Settings
     ENABLE_AUTO_POLLING: bool = False
