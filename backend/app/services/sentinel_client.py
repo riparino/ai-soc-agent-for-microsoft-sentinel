@@ -6,11 +6,12 @@ import httpx
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 from app.config import settings
-from app.services.workspace_registry import workspace_registry, WorkspaceConfig
+from app.services.workspace_registry import workspace_registry, WorkspaceConfig, WORKSPACE_REF_SEPARATOR
+from app.services.errors import SocError, auth_error, classify_http, fleet_not_configured, from_exception, workspace_unknown
 
 logger = logging.getLogger(__name__)
 
-# Sample Mock Incidents for Standalone Testing / Demo Mode
+# Sample incidents for DEMO_MODE / tests only - never served by a live install
 MOCK_INCIDENTS: List[Dict[str, Any]] = [
     {
         "id": "inc-2026-9041",
@@ -347,13 +348,16 @@ class SentinelClient:
         self.auth_mode = resolve_auth_mode()
         self.is_live = bool(not settings.DEMO_MODE and has_live_credentials())
         self.credential = None
+        self.init_error: Optional[str] = None
+        self.token_error: Optional[str] = None
 
         if self.is_live:
             try:
                 self.credential = build_credential()
                 logger.info("Initialized Azure credential for the workspace fleet (auth mode: %s).", self.auth_mode)
             except Exception as e:
-                logger.warning(f"Could not initialize Azure credentials: {e}. Running in simulation/demo mode.")
+                logger.warning(f"Could not initialize Azure credentials: {e}.")
+                self.init_error = f"{type(e).__name__}: {e}"
                 self.is_live = False
         # Refresh the workspace fleet in case configuration changed.
         try:
@@ -367,9 +371,10 @@ class SentinelClient:
         if self.credential:
             try:
                 token_obj = self.credential.get_token("https://management.azure.com/.default")
+                self.token_error = None
                 return token_obj.token
-            except Exception:
-                pass
+            except Exception as e:
+                self.token_error = f"{type(e).__name__}: {e}"
         # Direct OAuth2 REST token fallback (service-principal mode only).
         if getattr(self, "auth_mode", None) == "service_principal" and settings.AZURE_TENANT_ID and settings.AZURE_CLIENT_ID and settings.AZURE_CLIENT_SECRET:
             try:
@@ -387,6 +392,35 @@ class SentinelClient:
             except Exception as e:
                 logger.error(f"Failed to obtain Azure ARM bearer token: {e}")
         return None
+
+    def _require_token(self) -> str:
+        """ARM token or a NOT_AUTHENTICATED error that tells the analyst what to do."""
+        if not self.is_live:
+            self._init_client()
+        token = self._get_arm_token() if self.is_live else None
+        if not token:
+            detail = self.token_error or self.init_error or (
+                "no credential configured (AZURE_AUTH_MODE=%s)" % self.auth_mode
+            )
+            raise auth_error(detail)
+        return token
+
+    @staticmethod
+    def _require_workspace(workspace: Optional[WorkspaceConfig], incident_id: Optional[str] = None) -> WorkspaceConfig:
+        """A routable workspace or FLEET_NOT_CONFIGURED / WORKSPACE_UNKNOWN."""
+        if not workspace_registry.list_workspaces():
+            raise fleet_not_configured()
+        if workspace is None or workspace_registry.get(workspace.id) is None:
+            wid = incident_id.split(WORKSPACE_REF_SEPARATOR, 1)[0] if incident_id and WORKSPACE_REF_SEPARATOR in incident_id else incident_id
+            raise workspace_unknown(wid)
+        if not workspace.has_arm_coordinates():
+            raise SocError(
+                "WORKSPACE_INCOMPLETE",
+                f"Workspace '{workspace.id}' has no subscription / resource group / workspace name in the fleet file.",
+                what_to_check=["Re-run ./run-mcp.sh --discover-workspaces to regenerate workspaces.json."],
+                workspace=workspace.id, incident_ref=incident_id,
+            )
+        return workspace
 
     def _get_base_url(self, workspace: WorkspaceConfig) -> str:
         """ARM SecurityInsights base URL for an explicit workspace."""
@@ -631,8 +665,7 @@ class SentinelClient:
 
         resp = await client.get(url, headers=headers)
         if resp.status_code != 200:
-            logger.error(f"Failed to query Sentinel API for workspace '{workspace.id}' (HTTP {resp.status_code}): {resp.text}")
-            return []
+            raise classify_http(resp.status_code, resp.text, workspace=workspace, resource="workspace")
 
         raw_incidents = resp.json().get("value", [])
         mapped = []
@@ -686,19 +719,7 @@ class SentinelClient:
                     results[i]["alerts"] = alrts
 
         for inc in results:
-            if not inc.get("alerts"):
-                inc["alerts"] = [{
-                    "id": f"al-{str(inc.get('id', ''))[:8]}",
-                    "title": inc.get("title"),
-                    "description": inc.get("description") or "Analytic detection triggered in Microsoft Sentinel.",
-                    "severity": inc.get("severity", "Medium"),
-                    "vendor": "Microsoft Sentinel (Analytics Rule)",
-                    "product": "Microsoft Sentinel",
-                    "tactics": inc.get("tactics", []),
-                    "techniques": inc.get("techniques", []),
-                    "timeGenerated": inc.get("createdTimeUtc"),
-                    "alertLink": f"https://portal.azure.com/#blade/Microsoft_Azure_Security_Insights/IncidentOverviewBlade/id/{inc.get('id')}"
-                }]
+            inc.setdefault("alerts", [])
             self._namespace(inc, workspace)
 
         logger.info(f"Fetched {len(results)} incidents from Sentinel workspace '{workspace.display_name}' ({workspace.id}).")
@@ -728,6 +749,76 @@ class SentinelClient:
             results.append(self._namespace({**inc}, workspace))
         return results
 
+    async def list_incidents_detailed(
+        self,
+        filter_status: Optional[str] = None,
+        severity: Optional[str] = None,
+        time_range_days: Optional[int] = None,
+        workspace: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """List incidents across one, several, or all workspaces, reporting per-workspace
+        failures instead of hiding them.
+
+        Returns ``{"incidents": [...], "errors": [SocError.to_dict(), ...], "workspaces_queried": n}``.
+        A workspace that fails (403 from a customer whose delegation lacks our role,
+        404 for stale coordinates, throttling...) appears in ``errors`` with the exact
+        text to pass to the SOC admin; the others still return their incidents. In
+        live mode nothing is ever substituted from sample data.
+        """
+        targets = workspace_registry.resolve_targets(workspace)
+
+        if settings.DEMO_MODE:
+            return {
+                "incidents": self._sort_incidents(self._mock_incidents_for(targets, filter_status, severity, time_range_days)),
+                "errors": [],
+                "workspaces_queried": len(targets),
+            }
+
+        if not workspace_registry.list_workspaces():
+            raise fleet_not_configured()
+        if workspace and workspace.lower() != "all" and not targets:
+            raise workspace_unknown(workspace)
+        token = self._require_token()
+
+        live_targets = [ws for ws in targets if ws.has_arm_coordinates()]
+        errors: List[Dict[str, Any]] = [
+            SocError("WORKSPACE_INCOMPLETE", f"Workspace '{ws.id}' has no ARM coordinates in the fleet file.",
+                     what_to_check=["Re-run ./run-mcp.sh --discover-workspaces."], workspace=ws.id).to_dict()
+            for ws in targets if not ws.has_arm_coordinates()
+        ]
+        # Enrich inline only for a single-workspace view; for fleet-wide aggregation
+        # skip it so we don't fan out into thousands of calls.
+        enrich = len(live_targets) == 1
+        semaphore = asyncio.Semaphore(10)
+        results: List[Dict[str, Any]] = []
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            async def _fetch_one(ws: WorkspaceConfig):
+                async with semaphore:
+                    try:
+                        return await self._list_live_for_workspace(
+                            client, ws, token, filter_status, severity, time_range_days, enrich=enrich
+                        )
+                    except Exception as e:  # noqa: BLE001 - reported per workspace
+                        err = from_exception(e, workspace=ws)
+                        logger.error("Listing incidents for workspace '%s' failed: %s", ws.id, err.message)
+                        return err
+
+            per_workspace = await asyncio.gather(*[_fetch_one(ws) for ws in live_targets])
+        for chunk in per_workspace:
+            if isinstance(chunk, SocError):
+                errors.append(chunk.to_dict())
+            else:
+                results.extend(chunk)
+        if live_targets and len(errors) == len(targets):
+            # Every workspace failed: surface the first error as the call's error so
+            # the analyst is not shown an innocent-looking empty list.
+            first = errors[0]
+            raise SocError(first["error"], first["message"], what_to_check=first.get("what_to_check"),
+                           tell_admin=first.get("tell_admin"), workspace=first.get("workspace"),
+                           http_status=first.get("http_status"), detail=first.get("detail"))
+        return {"incidents": self._sort_incidents(results), "errors": errors, "workspaces_queried": len(targets)}
+
     async def list_incidents(
         self,
         filter_status: Optional[str] = None,
@@ -735,54 +826,16 @@ class SentinelClient:
         time_range_days: Optional[int] = None,
         workspace: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """List incidents across one, several, or all workspaces in the fleet.
-
-        ``workspace`` is a selector: ``None``/``"all"`` aggregates the whole fleet,
-        or a single id / comma-separated list of ids selects specific workspaces.
-        Every returned incident carries a namespaced ``id`` plus ``workspaceId`` /
-        ``workspaceName`` so it can be routed back to its origin workspace.
-        """
-        targets = workspace_registry.resolve_targets(workspace)
-
-        if self.is_live:
-            token = self._get_arm_token()
-            if token:
-                live_targets = [ws for ws in targets if ws.has_arm_coordinates()]
-                # Enrich inline only for a single-workspace view; for fleet-wide
-                # aggregation skip it so we don't fan out into thousands of calls.
-                enrich = len(live_targets) == 1
-                # Bound concurrency so a ~90-workspace fleet doesn't open 90
-                # simultaneous ARM connections at once.
-                semaphore = asyncio.Semaphore(10)
-                results: List[Dict[str, Any]] = []
-                try:
-                    async with httpx.AsyncClient(timeout=30.0) as client:
-                        async def _fetch_one(ws: WorkspaceConfig):
-                            async with semaphore:
-                                try:
-                                    return await self._list_live_for_workspace(
-                                        client, ws, token, filter_status, severity, time_range_days, enrich=enrich
-                                    )
-                                except Exception as e:
-                                    logger.error(f"Exception listing incidents for workspace '{ws.id}': {e}")
-                                    return []
-
-                        per_workspace = await asyncio.gather(*[_fetch_one(ws) for ws in live_targets])
-                        for chunk in per_workspace:
-                            results.extend(chunk)
-                    return self._sort_incidents(results)
-                except Exception as e:
-                    logger.error(f"Exception during multi-workspace incident retrieval: {e}")
-
-        # Demo / mock fallback.
-        return self._sort_incidents(self._mock_incidents_for(targets, filter_status, severity, time_range_days))
+        """Incidents only (see ``list_incidents_detailed`` for per-workspace errors)."""
+        return (await self.list_incidents_detailed(filter_status, severity, time_range_days, workspace))["incidents"]
 
     async def get_incident(self, incident_id: str) -> Optional[Dict[str, Any]]:
         """Fetch a single incident, routing to the workspace encoded in the ref."""
         workspace, raw_id = workspace_registry.resolve_ref(incident_id)
 
-        if self.is_live and workspace.has_arm_coordinates():
-            token = self._get_arm_token()
+        if not settings.DEMO_MODE:
+            workspace = self._require_workspace(workspace, incident_id)
+            token = self._require_token()
             if token:
                 try:
                     base_url = self._get_base_url(workspace)
@@ -790,6 +843,10 @@ class SentinelClient:
                     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
                     async with httpx.AsyncClient(timeout=15.0) as client:
                         resp = await client.get(url, headers=headers)
+                        if resp.status_code == 404:
+                            return None
+                        if resp.status_code != 200:
+                            raise classify_http(resp.status_code, resp.text, workspace=workspace, incident_ref=incident_id)
                         if resp.status_code == 200:
                             item = resp.json()
                             props = item.get("properties", {})
@@ -798,23 +855,13 @@ class SentinelClient:
                                 client, workspace, raw_id, headers
                             )
 
+                            entities_source = "sentinel-entities-api"
                             if not entities:
+                                # The entities API returned nothing: fall back to indicators
+                                # found in the title/description, and say so.
                                 combined_txt = f"{props.get('title', '')} {props.get('description', '')}"
                                 entities = extract_entities_from_text(combined_txt)
-
-                            if not alerts:
-                                alerts = [{
-                                    "id": f"al-{str(raw_id)[:8]}",
-                                    "title": props.get("title", f"Sentinel Incident #{props.get('incidentNumber', '')}"),
-                                    "description": props.get("description") or "Analytic detection triggered in Microsoft Sentinel.",
-                                    "severity": props.get("severity", "Medium"),
-                                    "vendor": "Microsoft Sentinel (Analytics Rule)",
-                                    "product": "Microsoft Sentinel",
-                                    "tactics": props.get("tactics", []),
-                                    "techniques": [],
-                                    "timeGenerated": props.get("createdTimeUtc"),
-                                    "alertLink": f"https://portal.azure.com/#blade/Microsoft_Azure_Security_Insights/IncidentOverviewBlade/id/{raw_id}"
-                                }]
+                                entities_source = "text-extraction" if entities else "none"
 
                             owner = props.get("owner", {})
                             owner_upn = owner.get("userPrincipalName") or owner.get("email")
@@ -842,15 +889,16 @@ class SentinelClient:
                                 "classificationReason": props.get("classificationReason"),
                                 "classificationComment": props.get("classificationComment"),
                                 "entities": entities,
+                                "entitiesSource": entities_source,
                                 "comments": comments,
                                 "alerts": alerts,
                                 "labels": labels
                             }
                             return self._namespace(incident, workspace)
                 except Exception as e:
-                    logger.error(f"Error fetching live incident {raw_id} in workspace '{workspace.id}': {e}")
+                    raise from_exception(e, workspace=workspace, incident_ref=incident_id)
 
-        # Mock fallback.
+        # Demo-mode mock path (live mode has already returned or raised above).
         for inc in MOCK_INCIDENTS:
             if inc["id"] == raw_id or str(inc.get("incidentNumber")) == raw_id:
                 return self._namespace({**inc, "owner": self._mock_owner(inc), "etag": inc.get("etag") or "0"}, workspace)
@@ -860,8 +908,9 @@ class SentinelClient:
         """Post an investigation note to the incident's origin workspace."""
         workspace, raw_id = workspace_registry.resolve_ref(incident_id)
 
-        if self.is_live and workspace.has_arm_coordinates():
-            token = self._get_arm_token()
+        if not settings.DEMO_MODE:
+            workspace = self._require_workspace(workspace, incident_id)
+            token = self._require_token()
             if token:
                 try:
                     comment_name = str(uuid.uuid4())
@@ -874,10 +923,11 @@ class SentinelClient:
                         if resp.status_code in [200, 201]:
                             logger.info(f"Comment posted to incident {raw_id} in workspace '{workspace.id}'.")
                             return {"status": "SUCCESS", "comment": {"id": comment_name, "message": message, "author": author}}
+                        raise classify_http(resp.status_code, resp.text, workspace=workspace, incident_ref=incident_id)
                 except Exception as e:
-                    logger.error(f"Failed to post comment to incident {raw_id} in '{workspace.id}': {e}")
+                    raise from_exception(e, workspace=workspace, incident_ref=incident_id)
 
-        # Mock fallback.
+        # Demo-mode mock path (live mode has already returned or raised above).
         comment_entry = {
             "id": f"c-{uuid.uuid4().hex[:6]}",
             "author": author,
@@ -912,8 +962,9 @@ class SentinelClient:
         """
         workspace, raw_id = workspace_registry.resolve_ref(incident_id)
 
-        if self.is_live and workspace.has_arm_coordinates():
-            token = self._get_arm_token()
+        if not settings.DEMO_MODE:
+            workspace = self._require_workspace(workspace, incident_id)
+            token = self._require_token()
             if token:
                 try:
                     base_url = self._get_base_url(workspace)
@@ -977,11 +1028,13 @@ class SentinelClient:
                                 await self.add_comment(incident_id, comment_text, author=updated_by)
                                 return {"status": "SUCCESS", "incident": resp.json()}
                             else:
-                                logger.error(f"Failed to update incident {raw_id} (HTTP {resp.status_code}): {resp.text}")
+                                raise classify_http(resp.status_code, resp.text, workspace=workspace, incident_ref=incident_id)
+                        else:
+                            raise classify_http(r_get.status_code, r_get.text, workspace=workspace, incident_ref=incident_id)
                 except Exception as e:
-                    logger.error(f"Error updating incident {raw_id} in '{workspace.id}': {e}")
+                    raise from_exception(e, workspace=workspace, incident_ref=incident_id)
 
-        # Mock fallback.
+        # Demo-mode mock path (live mode has already returned or raised above).
         for inc in MOCK_INCIDENTS:
             if inc["id"] == raw_id or str(inc.get("incidentNumber")) == raw_id:
                 if expected_etag is not None and str(expected_etag) != str(inc.get("etag") or "0"):
@@ -1004,125 +1057,6 @@ class SentinelClient:
                 self._mock_bump(inc)
                 return {"status": "SUCCESS", "incident": self._namespace({**inc, "owner": self._mock_owner(inc)}, workspace)}
         return {"status": "NOT_FOUND", "message": f"Incident {incident_id} not found."}
-
-    async def get_entra_users(self, workspace: Optional[WorkspaceConfig] = None) -> List[Dict[str, Any]]:
-        """
-        List SOC engineers / tenant users for a workspace.
-
-        Microsoft Graph is NOT delegated by Azure Lighthouse, so directory access
-        depends on the workspace's ``graph_mode``:
-
-          * ``delegated-app``   - use the per-customer app registration to read the
-            customer tenant's directory via Microsoft Graph.
-          * ``managing-tenant`` - use the shared home SP's Graph token (home tenant).
-          * ``log-analytics-only`` - Graph cannot see the customer tenant from this
-            instance, so users are derived from the workspace's own SigninLogs
-            telemetry (which IS reachable via Lighthouse). Identity *write*
-            remediation remains unavailable for this workspace.
-        """
-        workspace = workspace or workspace_registry.managing_workspace() or workspace_registry.default()
-        users_map: Dict[str, Dict[str, Any]] = {}
-
-        if self.is_live and workspace:
-            graph_credential = None
-            graph_source = None
-            try:
-                mode = workspace.graph_mode
-                if mode == "delegated-app":
-                    from azure.identity import ClientSecretCredential
-                    graph_credential = ClientSecretCredential(
-                        tenant_id=workspace.graph_tenant_id,
-                        client_id=workspace.graph_client_id,
-                        client_secret=workspace.graph_client_secret,
-                    )
-                    graph_source = f"Microsoft Graph (delegated app · {workspace.display_name})"
-                elif mode == "managing-tenant" and self.credential:
-                    graph_credential = self.credential
-                    graph_source = "Microsoft Graph API (managing tenant)"
-
-                if graph_credential:
-                    graph_token = graph_credential.get_token("https://graph.microsoft.com/.default")
-                    if graph_token and graph_token.token:
-                        headers = {"Authorization": f"Bearer {graph_token.token}", "Content-Type": "application/json"}
-                        async with httpx.AsyncClient(timeout=8.0) as client:
-                            resp = await client.get(
-                                "https://graph.microsoft.com/v1.0/users?$select=id,displayName,userPrincipalName,mail,jobTitle,department&$top=100&$orderby=displayName",
-                                headers=headers
-                            )
-                            if resp.status_code == 200:
-                                for u in resp.json().get("value", []):
-                                    upn = u.get("userPrincipalName") or u.get("mail")
-                                    if upn:
-                                        users_map[upn.lower()] = {
-                                            "objectId": u.get("id"),
-                                            "displayName": u.get("displayName") or upn.split("@")[0],
-                                            "userPrincipalName": upn,
-                                            "email": u.get("mail") or upn,
-                                            "jobTitle": u.get("jobTitle") or "SOC Analyst",
-                                            "source": graph_source
-                                        }
-                                if users_map:
-                                    logger.info(f"Fetched {len(users_map)} users via {graph_source} for workspace '{workspace.id}'.")
-                                    return sorted(list(users_map.values()), key=lambda x: x.get("displayName", ""))
-            except Exception as e:
-                logger.debug(f"Graph lookup note for workspace '{workspace.id}' (falling back to telemetry): {e}")
-
-        # Log Analytics SigninLogs telemetry (Lighthouse-honored) - the directory
-        # fallback for delegated tenants where Graph is unavailable.
-        if self.is_live and workspace and self.credential:
-            try:
-                ws_token = self.credential.get_token("https://api.loganalytics.io/.default")
-                ws_id = await self.resolve_workspace_guid(workspace)
-                if ws_token and ws_id:
-                    query = (
-                        "SigninLogs "
-                        "| where isnotempty(UserPrincipalName) and isnotempty(UserDisplayName) "
-                        "| summarize LastSeen=max(TimeGenerated), SigninCount=count() by UserPrincipalName, UserDisplayName, UserId "
-                        "| top 50 by SigninCount desc"
-                    )
-                    headers = {"Authorization": f"Bearer {ws_token.token}", "Content-Type": "application/json"}
-                    async with httpx.AsyncClient(timeout=12.0) as client:
-                        resp = await client.post(
-                            f"https://api.loganalytics.io/v1/workspaces/{ws_id}/query",
-                            headers=headers,
-                            json={"query": query}
-                        )
-                        if resp.status_code == 200:
-                            rows = resp.json().get("tables", [{}])[0].get("rows", [])
-                            for row in rows:
-                                upn = str(row[0]).strip()
-                                name = str(row[1]).strip()
-                                obj_id = str(row[2]).strip() if len(row) > 2 else None
-                                if upn and name and upn.lower() not in users_map:
-                                    role_title = "SOC Security Engineer" if "admin" in upn.lower() or "admin" in name.lower() else "Security Analyst"
-                                    users_map[upn.lower()] = {
-                                        "objectId": obj_id,
-                                        "displayName": name,
-                                        "userPrincipalName": upn,
-                                        "email": upn,
-                                        "jobTitle": role_title,
-                                        "source": f"SigninLogs telemetry · {workspace.display_name} (Lighthouse)"
-                                    }
-            except Exception as e:
-                logger.error(f"Error querying Entra ID users from Log Analytics for '{workspace.id}': {e}")
-
-        if users_map:
-            logger.info(f"Retrieved {len(users_map)} directory users for workspace '{workspace.id if workspace else 'default'}'.")
-            return sorted(list(users_map.values()), key=lambda x: x.get("displayName", ""))
-
-        # Standard fallback list of SOC engineers (demo / unconfigured).
-        fallback_users = [
-            {"objectId": "23d99f38-0162-4ce5-b160-67e1d83ec97e", "displayName": "Ankush Chouhan", "userPrincipalName": "ankush@security.corp", "email": "ankush@security.corp", "jobTitle": "Lead SOC Engineer", "source": "Entra ID Directory"},
-            {"objectId": "341c3e9b-7c8c-4fee-9388-94b38cdbe4d3", "displayName": "SOC Administrator", "userPrincipalName": "socadmin@security.corp", "email": "socadmin@security.corp", "jobTitle": "Principal Incident Responder", "source": "Entra ID Directory"},
-            {"objectId": "cc3b87e1-ee33-4a90-b2d3-948bcfa6360a", "displayName": "Alex Chen", "userPrincipalName": "alex.chen@security.corp", "email": "alex.chen@security.corp", "jobTitle": "Senior SOC Analyst", "source": "Entra ID Directory"},
-            {"objectId": "e3341791-981b-4c78-a46a-7c839312c6a7", "displayName": "Sarah Jenkins", "userPrincipalName": "sarah.j@security.corp", "email": "sarah.j@security.corp", "jobTitle": "Threat Hunting Specialist", "source": "Entra ID Directory"},
-            {"objectId": "dd3a9f69-8654-4c41-9abd-97bba090335f", "displayName": "David Vance", "userPrincipalName": "david.v@security.corp", "email": "david.v@security.corp", "jobTitle": "Security Operations Specialist", "source": "Entra ID Directory"},
-            {"objectId": "e1d6bad5-9292-4895-a6b0-6dbcf8966de9", "displayName": "Elena Rostova", "userPrincipalName": "elena.r@security.corp", "email": "elena.r@security.corp", "jobTitle": "Tier-2 SOC Analyst", "source": "Entra ID Directory"},
-            {"objectId": "8ce11533-351a-4862-abdf-a60d27da5a17", "displayName": "Marcus Thorne", "userPrincipalName": "marcus.t@security.corp", "email": "marcus.t@security.corp", "jobTitle": "Cyber Threat Analyst", "source": "Entra ID Directory"},
-            {"objectId": "bab8db06-ff5b-4fb2-9c10-f7dc1c214582", "displayName": "Jordan Lee", "userPrincipalName": "jordan.l@security.corp", "email": "jordan.l@security.corp", "jobTitle": "Cloud Security Engineer", "source": "Entra ID Directory"},
-            {"objectId": "6cd93032-66d9-480a-8384-9082402e78ed", "displayName": "Rachel Adams", "userPrincipalName": "rachel.a@security.corp", "email": "rachel.a@security.corp", "jobTitle": "SOC Analyst", "source": "Entra ID Directory"}
-        ]
-        return fallback_users
 
     async def assign_incident(
         self,
@@ -1163,8 +1097,9 @@ class SentinelClient:
                 "hint": "Coordinate with the current owner, or assign without only_if_unassigned to take it over deliberately.",
             }
 
-        if self.is_live and workspace.has_arm_coordinates():
-            token = self._get_arm_token()
+        if not settings.DEMO_MODE:
+            workspace = self._require_workspace(workspace, incident_id)
+            token = self._require_token()
             if token:
                 try:
                     base_url = self._get_base_url(workspace)
@@ -1206,11 +1141,13 @@ class SentinelClient:
                                     "owner": owner_obj
                                 }
                             else:
-                                logger.error(f"Failed to assign incident {raw_id} (HTTP {resp.status_code}): {resp.text}")
+                                raise classify_http(resp.status_code, resp.text, workspace=workspace, incident_ref=incident_id)
+                        else:
+                            raise classify_http(r_get.status_code, r_get.text, workspace=workspace, incident_ref=incident_id)
                 except Exception as e:
-                    logger.error(f"Error during incident assignment via ARM API for '{workspace.id}': {e}")
+                    raise from_exception(e, workspace=workspace, incident_ref=incident_id)
 
-        # Mock fallback.
+        # Demo-mode mock path (live mode has already returned or raised above).
         for inc in MOCK_INCIDENTS:
             if inc["id"] == raw_id or str(inc.get("incidentNumber")) == raw_id:
                 current_owner = self._mock_owner(inc)

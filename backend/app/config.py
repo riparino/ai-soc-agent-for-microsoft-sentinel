@@ -1,23 +1,13 @@
 import os
 from pydantic_settings import BaseSettings
-from typing import Optional, List
+from typing import Optional
 
 class Settings(BaseSettings):
-    # Application Config
-    APP_NAME: str = "Microsoft Sentinel AI Triage Agent"
-    APP_ENV: str = "production"
+    """Settings for the per-analyst Sentinel MCP server (loaded from backend/.env)."""
+
+    APP_NAME: str = "Microsoft Sentinel AI SOC Agent (MCP)"
     DEBUG: bool = False
-    PORT: int = 8000
-    HOST: str = "0.0.0.0"
-    CORS_ORIGINS: List[str] = ["*"]
-    
-    # JWT Authentication
-    SECRET_KEY: str = "sentinel-super-secret-key-change-in-production-2026"
-    ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 12 # 12 hours
-    ADMIN_USERNAME: str = "soc_admin"
-    ADMIN_PASSWORD: Optional[str] = None
-    
+
     # Azure Sentinel & Azure Resource Manager Config
     # These are the *managing (home) tenant* service-principal credentials. Under
     # Azure Lighthouse a single home-tenant SP can reach ARM + Log Analytics across
@@ -50,15 +40,16 @@ class Settings(BaseSettings):
     # an inline JSON array (WORKSPACES_JSON) or a path to a JSON file
     # (WORKSPACES_CONFIG_PATH). Each entry supports:
     #   id, display_name, tenant_id, subscription_id, resource_group,
-    #   workspace_name, workspace_guid, is_managing_tenant,
-    #   graph_tenant_id, graph_client_id, graph_client_secret
+    #   workspace_name, workspace_guid, is_managing_tenant
     # When neither is set the registry falls back to the single AZURE_* workspace
-    # above (or demo workspaces in DEMO_MODE).
+    # above; with nothing configured it is empty (demo workspaces only in DEMO_MODE).
     WORKSPACES_JSON: Optional[str] = None
     WORKSPACES_CONFIG_PATH: Optional[str] = None
     
-    # Simulation / Demo Mode (allows running standalone without live Azure credentials)
-    DEMO_MODE: bool = True
+    # Demo mode: built-in sample workspaces/incidents and simulated query results,
+    # for trying the tools with no Azure at all. OFF by default: a live install never
+    # substitutes sample data for a failed call - failures are reported as errors.
+    DEMO_MODE: bool = False
     
     # LLM Settings (Supports Azure OpenAI, OpenAI, or compatible APIs)
     LLM_PROVIDER: str = "azure_openai" # "azure_openai", "openai", "custom"
@@ -107,9 +98,7 @@ class Settings(BaseSettings):
     HUNT_MAX_QUERIES: int = 12
     HUNT_MAX_ROWS: int = 25
 
-    # Auto-Triage & Polling Settings
-    ENABLE_AUTO_POLLING: bool = False
-    POLL_INTERVAL_SECONDS: int = 120
+    # Post the AI triage report back to the incident as a comment (only when a verdict exists).
     AUTO_POST_COMMENTS_TO_SENTINEL: bool = True
     AUTO_CLOSE_FALSE_POSITIVES: bool = False
     

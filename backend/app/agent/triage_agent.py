@@ -1,9 +1,9 @@
 import json
 import logging
 import asyncio
-from typing import Dict, Any, List, Optional, Callable
+from typing import Dict, Any, Optional, Callable
 from app.config import settings
-from app.agent.prompts import SOC_TRIAGE_SYSTEM_PROMPT, SOC_CHAT_SYSTEM_PROMPT
+from app.agent.prompts import SOC_TRIAGE_SYSTEM_PROMPT
 from app.agent.tools import execute_tool_call
 from app.services.sentinel_client import sentinel_client
 from app.services.workspace_registry import workspace_registry
@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 class SentinelTriageAgent:
     def __init__(self):
         self.openai_client = None
+        self.llm_init_error: Optional[str] = None
         self._init_llm_client()
 
     def _init_llm_client(self):
@@ -30,7 +31,12 @@ class SentinelTriageAgent:
                 self.openai_client = OpenAI(api_key=settings.OPENAI_API_KEY)
                 logger.info("Initialized standard OpenAI client.")
         except Exception as e:
-            logger.warning(f"Could not initialize OpenAI client (using built-in reasoning engine): {e}")
+            logger.warning(f"Could not initialize OpenAI client: {e}")
+            self.llm_init_error = f"{type(e).__name__}: {e}"
+
+    @property
+    def llm_configured(self) -> bool:
+        return self.openai_client is not None
 
     async def triage_incident(
         self,
@@ -152,7 +158,43 @@ class SentinelTriageAgent:
         await notify("REASONING", "Synthesizing evidence with AI reasoning engine, calculating confidence score, and mapping to MITRE ATT&CK tactics...")
         await asyncio.sleep(0.8)
 
-        # Check if live OpenAI model is configured and active
+        def evidence_pack(status: str, message: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            """Everything collected, no invented verdict. The MCP client reasons over it."""
+            pack = {
+                "incident_id": incident_id,
+                "status": status,
+                "verdict": None,
+                "message": message,
+                "incident": {k: incident.get(k) for k in ("id", "incidentNumber", "title", "description", "severity", "status",
+                                                           "createdTimeUtc", "tactics", "labels", "owner", "workspaceId", "workspaceName")},
+                "entities": {"ips": extracted_ips, "accounts": extracted_accounts, "hosts": extracted_hosts, "processes": extracted_processes},
+                "alerts": incident.get("alerts", []),
+                "comments": incident.get("comments", [])[-10:],
+                "threat_intel": ti_results,
+                "data_coverage": data_coverage,
+                "kql_findings": kql_findings,
+                "kql_queries_used": executed_kql_queries,
+                "hunting": {"summary": hunt["summary"], "tables_available": hunt["tables"]["available"], "skipped": hunt["skipped"]},
+                "how_to_use": (
+                    "Reason over kql_findings (only SUCCESS hunts with rows are evidence), threat_intel and the "
+                    "alerts/comments to reach a verdict (TRUE_POSITIVE / FALSE_POSITIVE / SUSPICIOUS_ESCALATE), "
+                    "state the visibility gaps from data_coverage, then record the conclusion with sentinel_add_comment."
+                ),
+            }
+            if extra:
+                pack.update(extra)
+            return pack
+
+        if not settings.DEMO_MODE and not self.openai_client:
+            pack = evidence_pack(
+                "EVIDENCE_COLLECTED",
+                "No server-side LLM is configured (fine for MCP use): the hunts and intel lookups ran; the MCP client should reason over this evidence.",
+                {"llm": {"configured": False, "init_error": self.llm_init_error}},
+            )
+            await notify("EVIDENCE_COLLECTED", f"Evidence pack ready: {hunt['summary']['executed']} hunts, {len(ti_results)} intel lookups; no server LLM, verdict left to the client.", {"summary": hunt["summary"]})
+            return pack
+
+        # Server-side LLM verdict (live mode with Azure OpenAI / OpenAI configured)
         if self.openai_client and not settings.DEMO_MODE:
             try:
                 model_name = settings.AZURE_OPENAI_DEPLOYMENT_NAME if settings.LLM_PROVIDER == "azure_openai" else "gpt-4o"
@@ -201,9 +243,19 @@ class SentinelTriageAgent:
                 
                 return verdict_json
             except Exception as e:
-                logger.error(f"OpenAI completion error: {e}. Falling back to deterministic SOC reasoning engine.")
+                logger.error(f"LLM completion error: {e}")
+                pack = evidence_pack(
+                    "LLM_FAILED",
+                    "The hunts and intel lookups ran, but the server-side LLM call failed, so no verdict was produced. The evidence is below for the MCP client to reason over.",
+                    {"llm": {"configured": True, "error": f"{type(e).__name__}: {e}"[:500],
+                             "what_to_check": ["AZURE_OPENAI_ENDPOINT / AZURE_OPENAI_API_KEY / AZURE_OPENAI_DEPLOYMENT_NAME in backend/.env",
+                                               "The deployment name exists and your key has access; see `llm.error`."],
+                             "tell_admin": f"Server LLM call failed during triage: {type(e).__name__}: {str(e)[:200]}"}},
+                )
+                await notify("LLM_FAILED", f"LLM call failed ({type(e).__name__}); returning evidence pack without a verdict.", {"error": str(e)[:300]})
+                return pack
 
-        # Built-in High-Accuracy SOC Reasoning Engineine
+        # Demo-mode deterministic engine (DEMO_MODE only; never used against live data)
         verdict = "SUSPICIOUS_ESCALATE"
         confidence = 85
         severity = incident.get("severity", "Medium")
@@ -438,129 +490,5 @@ class SentinelTriageAgent:
 
         return final_report
 
-    async def chat_with_incident(
-        self,
-        incident: Dict[str, Any],
-        user_message: str,
-        chat_history: List[Dict[str, str]]
-    ) -> str:
-        """Interactive Q&A with the SOC Analyst regarding the incident"""
-        if self.openai_client:
-            try:
-                model_name = settings.AZURE_OPENAI_DEPLOYMENT_NAME if settings.LLM_PROVIDER == "azure_openai" else "gpt-4o"
-                messages = [
-                    {"role": "system", "content": SOC_CHAT_SYSTEM_PROMPT + f"\nIncident Context:\n{json.dumps(incident)}"}
-                ]
-                for msg in chat_history[-6:]:
-                    messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
-                messages.append({"role": "user", "content": user_message})
-
-                try:
-                    response = self.openai_client.chat.completions.create(
-                        model=model_name,
-                        messages=messages,
-                        max_completion_tokens=2000
-                    )
-                except Exception as param_err:
-                    if "max_completion_tokens" in str(param_err).lower() or "unsupported" in str(param_err).lower():
-                        response = self.openai_client.chat.completions.create(
-                            model=model_name,
-                            messages=messages,
-                            max_tokens=2000,
-                            temperature=0.2
-                        )
-                    else:
-                        raise param_err
-                return response.choices[0].message.content
-            except Exception as e:
-                logger.error(f"Chat error: {e}")
-
-        # Deterministic KQL Generator responses tailored to incident entities
-        msg_lower = user_message.lower()
-        entities = incident.get('entities', [])
-        user_entity = next((e.get('upn') or e.get('name') for e in entities if e.get('kind') == 'Account'), 'jdoe@cybersecurity.corp')
-        ip_entity = next((e.get('address') for e in entities if e.get('kind') == 'Ip'), '185.220.101.5')
-        host_entity = next((e.get('name') for e in entities if e.get('kind') == 'Host'), 'FINANCE-SRV-01')
-
-        if "process" in msg_lower or "powershell" in msg_lower or "cmd" in msg_lower:
-            return f"""Here is a specialized **Process Lineage & Subprocess Execution** KQL hunting query:
-
-```kql
-let targetHost = "{host_entity}";
-DeviceProcessEvents
-| where TimeGenerated >= ago(7d)
-| where DeviceName has targetHost or AccountName has "{user_entity.split('@')[0]}"
-| where FileName in~ ("powershell.exe", "cmd.exe", "wscript.exe", "cscript.exe", "rundll32.exe", "mshta.exe", "whoami.exe")
-| project TimeGenerated, DeviceName, AccountName, InitiatingProcessFileName, InitiatingProcessCommandLine, FileName, ProcessCommandLine
-| sort by TimeGenerated desc
-| take 50
-```
-
-**Query Purpose:** Uncovers anomalous parent-child execution lineages (e.g. `WINWORD.EXE` -> `powershell.exe` -> `whoami.exe`) and hidden Base64 payloads."""
-
-        elif "ip" in msg_lower or "network" in msg_lower or "c2" in msg_lower or "traffic" in msg_lower:
-            return f"""Here is a specialized **Network Beaconing & C2 Egress** KQL hunting query:
-
-```kql
-let targetIP = "{ip_entity}";
-CommonSecurityLog
-| where TimeGenerated >= ago(14d)
-| where DestinationIP == targetIP or SourceIP == targetIP
-| summarize TotalPackets=sum(ReceivedBytes), HitCount=count(), FirstSeen=min(TimeGenerated), LastSeen=max(TimeGenerated) by SourceIP, DestinationIP, DestinationPort, DeviceAction
-| sort by HitCount desc
-```
-
-**Query Purpose:** Tracks bidirectional firewall connections to external IP `{ip_entity}`, evaluating data transfer volumes and connection frequency."""
-
-        elif "privilege" in msg_lower or "role" in msg_lower or "entra" in msg_lower or "admin" in msg_lower:
-            return """Here is a specialized **Entra ID Privilege Escalation & Role Modification** KQL query:
-
-```kql
-AuditLogs
-| where TimeGenerated >= ago(30d)
-| where OperationName has "Add member to role" or OperationName has "Add eligible member to role" or OperationName has "Update user"
-| extend TargetUser = tostring(TargetResources[0].userPrincipalName)
-| extend InitiatedBy = tostring(InitiatedBy.user.userPrincipalName)
-| project TimeGenerated, OperationName, Result, InitiatedBy, TargetUser, TargetResources
-| sort by TimeGenerated desc
-```
-
-**Query Purpose:** Detects unauthorized global administrator assignments and directory role escalations."""
-
-        elif "ti" in msg_lower or "threat intel" in msg_lower or "indicator" in msg_lower:
-            return f"""Here is a **Sentinel Threat Intelligence Correlation** KQL hunting query:
-
-```kql
-ThreatIntelligenceIndicator
-| where TimeGenerated >= ago(90d)
-| where IsActive == true
-| where NetworkIP == "{ip_entity}" or Description has "{incident.get('title', '')}"
-| project TimeGenerated, ThreatType, ConfidenceScore, Description, ThreatActor, ExpirationDateTime
-| sort by TimeGenerated desc
-```
-
-**Query Purpose:** Correlates incident IOCs against Microsoft Defender TI & STIX/TAXII threat feeds."""
-
-        else:
-            return f"""Here is a targeted **7-Day Authentication Baseline & Impossible Travel** KQL hunting query for **{user_entity}**:
-
-```kql
-let targetUser = "{user_entity}";
-SigninLogs
-| where TimeGenerated >= ago(7d)
-| where UserPrincipalName =~ targetUser
-| summarize 
-    LoginAttempts = count(),
-    SuccessfulLogins = countif(ResultType == 0),
-    FailedLogins = countif(ResultType != 0),
-    DistinctIPs = dcount(IPAddress),
-    IPList = make_set(IPAddress),
-    Locations = make_set(Location),
-    AppsUsed = make_set(AppDisplayName)
-    by UserPrincipalName, bin(TimeGenerated, 1d)
-| sort by TimeGenerated desc
-```
-
-**Query Purpose:** Analyzes login frequency, geographic distribution, and client application profiles to identify credential stuffing or session token theft."""
 
 triage_agent = SentinelTriageAgent()

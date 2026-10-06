@@ -1,38 +1,47 @@
-# Run the Sentinel MCP server locally — analyst setup
+# Run the Sentinel MCP server on your own machine — analyst setup
 
-Each analyst runs the MCP server **on their own machine** and uses it from Claude
-Desktop, Claude Code or VS Code. There is no shared server, no open port and **no
-secrets on the laptop**: the server authenticates to Azure as *you*, using your
-`az login` session. Under Azure Lighthouse your own delegated Sentinel roles apply
-across every customer workspace, and every comment, assignment or closure you make
-is recorded in Sentinel under your name.
+You get Microsoft Sentinel — every customer workspace delegated to us through
+Azure Lighthouse — as tools inside Claude Desktop, Claude Code or VS Code. There
+is no web app, no shared server and **no secrets on your laptop**: the server
+runs as *you* (your `az login`), your Lighthouse-delegated **Microsoft Sentinel
+Responder** role applies across every customer workspace, and every comment,
+assignment or closure you make is recorded in Sentinel under your name.
 
-The scope is **Microsoft Sentinel only**: incidents, comments, status and
-assignment, AI triage, and KQL against the customer's Log Analytics data. There are
-no Entra ID (Microsoft Graph) or Defender XDR actions here — Azure Lighthouse
-doesn't delegate those, and the Sentinel roles you already hold are all this needs.
+Scope is **Microsoft Sentinel only**: incidents, comments, status and assignment,
+hunting with KQL across whatever the customer ingests, and AI-assisted triage.
+There are no Entra ID (Microsoft Graph) or Defender XDR *actions* — Lighthouse
+doesn't delegate those — and nothing is ever simulated: if a call fails you get
+an error that says what happened and what to tell the SOC admin.
 
-## What you need (one-time, from your SOC admin)
+## 1. Before you start
 
-- You should already be a member of **`lighthouse-sentinel-responders`**, the group
-  that holds the **Microsoft Sentinel Responder** authorization in every customer's
-  Lighthouse delegation. That one role covers everything this server does — read and
-  update incidents **and** run KQL (it includes
-  `Microsoft.OperationalInsights/workspaces/query/*/read`). Nothing to request —
-  if a customer workspace later shows `403`, that group's delegation is what to check.
-- Our managing tenant ID.
-- Python 3.11+, Git, and the **Azure CLI** (`az`).
+**From the SOC admin** — you should already have both:
 
-You generate the fleet file (`workspaces.json`) yourself in step 3 — it comes from
-Azure Resource Graph using your own login, so it lists exactly the customer
-workspaces you can see.
+- Membership of **`lighthouse-sentinel-responders`**, the group authorized with
+  Microsoft Sentinel Responder in every customer delegation. That one role covers
+  incidents *and* KQL (it carries `Microsoft.OperationalInsights/workspaces/query/*/read`).
+- Our **managing tenant ID** (`<managing-tenant-id>` below).
 
-## Setup
+**On your machine** — Python 3.11+, Git, the Azure CLI, and your MCP client:
 
-### macOS / Linux
+| | macOS (Homebrew) | Windows (winget) |
+|---|---|---|
+| Python 3.11+ | `brew install python@3.12` | `winget install Python.Python.3.12` |
+| Git | `brew install git` | `winget install Git.Git` |
+| Azure CLI | `brew install azure-cli` | `winget install Microsoft.AzureCLI` |
+
+Open a new terminal after installing so `az`, `git` and `python` are on PATH.
+MCP client: Claude Desktop, Claude Code, or VS Code with GitHub Copilot.
+
+## 2. Sign in, clone, install
+
+Clone the **`analyst-local`** branch specifically — the default branch is the
+hosted web console and does not contain this server.
+
+**macOS / Linux**
 
 ```bash
-az login --tenant <managing-tenant-id>             # your MSSP / home tenant
+az login --tenant <managing-tenant-id>
 git clone -b analyst-local https://github.com/riparino/ai-soc-agent-for-microsoft-sentinel.git
 cd ai-soc-agent-for-microsoft-sentinel/backend
 python3 -m venv venv && source venv/bin/activate
@@ -40,7 +49,7 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-### Windows (PowerShell)
+**Windows (PowerShell)**
 
 ```powershell
 az login --tenant <managing-tenant-id>
@@ -51,99 +60,105 @@ pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-### `.env` — the only lines that matter for local use
+`az login` opens a browser; pick your work account. If you have several tenants,
+`--tenant` makes sure the session is for the managing tenant (where the Lighthouse
+delegations are projected).
+
+## 3. Configure `.env` and generate your workspace list
+
+Open `backend/.env` and set **one** line — everything else already has the right
+defaults for an analyst machine:
 
 ```env
-DEMO_MODE=False
-AZURE_AUTH_MODE=user                     # use my az login session; no client secret
-AZURE_TENANT_ID=<managing-tenant-id>     # the tenant you signed in to
-WORKSPACES_CONFIG_PATH=./workspaces.json # the fleet file from your admin
-MCP_DISABLED_TOOLS=sentinel_check_ip_reputation,sentinel_check_file_hash   # optional
+AZURE_TENANT_ID="<managing-tenant-id>"
 ```
 
-Leave `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` empty. You don't need an Azure
-OpenAI key either: when you use the server from Claude or Copilot, *that* model does
-the reasoning; the server's own `sentinel_triage_incident` falls back to its built-in
-deterministic engine unless you configure one.
+(`DEMO_MODE=False`, `AZURE_AUTH_MODE=user` and `WORKSPACES_CONFIG_PATH=./workspaces.json`
+are already set. Leave the OpenAI and threat-intel keys empty: your MCP client is
+the reasoning engine.)
 
-### Generate the fleet file (`workspaces.json`)
+Then generate the customer workspace list with your own login:
 
 ```bash
-./run-mcp.sh --discover-workspaces        # Windows: .\run-mcp.ps1 --discover-workspaces
+./run-mcp.sh --discover-workspaces          # Windows: .\run-mcp.ps1 --discover-workspaces
 ```
 
-This runs an **Azure Resource Graph** query at tenant scope with your `az login`
-identity. Resource Graph includes every Azure Lighthouse-delegated subscription you
-can read, so the result is the full list of customer Sentinel workspaces you have
-access to — subscription, resource group, workspace name, Log Analytics GUID and the
-customer tenant ID — written to `backend/workspaces.json` next to `.env`.
+This runs an **Azure Resource Graph** query at tenant scope — the same data as the
+**Open query** button on the Microsoft Sentinel workspace list in the Azure portal.
+Lighthouse projects every delegated subscription into your session, so the result
+is every customer Sentinel workspace you can read: subscription, resource group,
+workspace name, Log Analytics GUID and tenant ID, written to `backend/workspaces.json`
+next to `.env` (coordinates only, no secrets).
 
-- Re-run it any time a customer is onboarded or offboarded. It **merges**: ids,
-  display names and the managing-tenant flag you edited by hand are kept,
-  coordinates are refreshed, new workspaces are appended, and workspaces you can no
-  longer see are kept but flagged.
-- `--dry-run` prints the file instead of writing it; `--include-all-workspaces` also
-  lists Log Analytics workspaces that aren't Sentinel-enabled.
-- Portal equivalent: in the Azure portal's **Microsoft Sentinel** (or Log Analytics
-  workspaces) list, **Open query** opens Azure Resource Graph Explorer with the same
-  data; **Run query → Download as CSV** gives you the list by hand. The tool just
-  saves you the CSV-to-JSON step. The query it runs:
+- Re-run it whenever a customer is onboarded or offboarded. It **merges**: ids and
+  display names you edited by hand are kept, coordinates are refreshed, new
+  workspaces are appended, and workspaces you can no longer see are kept but flagged.
+- `--dry-run` prints the file instead of writing it; `--include-all-workspaces`
+  also lists Log Analytics workspaces that aren't Sentinel-enabled.
 
-  ```kusto
-  resources
-  | where type =~ 'microsoft.operationalinsights/workspaces'
-  | join kind=inner (
-      resources
-      | where type =~ 'microsoft.operationsmanagement/solutions' and name startswith 'SecurityInsights('
-      | project id = tolower(tostring(properties.workspaceResourceId)))
-    on $left.['id'] == $right.['id']
-  | project name, resourceGroup, subscriptionId, tenantId, customerId = tostring(properties.customerId)
-  ```
-
-### Check, then connect your client
+## 4. Check the install
 
 ```bash
-./run-mcp.sh --check          # Windows: .\run-mcp.ps1 --check
+./run-mcp.sh --check                        # Windows: .\run-mcp.ps1 --check
 ```
 
-You should see your name under *Signed in as*, the fleet listed, and `OK` beside
-each workspace, then `READY`. Then print the config for your client and paste it:
+You should see your own name under **Signed in as**, every workspace **OK**,
+**KQL: OK**, and **READY** at the end. If not, the output names the fix, and when
+it can't be fixed from your side it prints a block that starts with
+`--- sentinel-mcp check ---` — **copy that block to the SOC admin**. It contains no
+secrets (your UPN, tenant, versions and the failing items).
+
+## 5. Connect your client
 
 ```bash
-./run-mcp.sh --print-config claude-desktop   # → Claude Desktop: Settings → Developer → Edit Config
-./run-mcp.sh --print-config vscode           # → .vscode/mcp.json
-./run-mcp.sh --print-config claude-code      # → prints the `claude mcp add …` command to run
+./run-mcp.sh --print-config claude-desktop  # or: vscode | claude-code
 ```
 
-The printed config uses this venv's Python and sets `PYTHONPATH`, so the client can
-launch the server from any working directory; the server loads the backend `.env`
-on its own. Restart the client and try:
+| Client | Paste the printed snippet into |
+|--------|-------------------------------|
+| Claude Desktop | Settings → Developer → Edit Config (`claude_desktop_config.json`), then restart Claude Desktop |
+| VS Code (GitHub Copilot) | `.vscode/mcp.json` in your workspace |
+| Claude Code | It prints a `claude mcp add …` command — run it |
 
-> "List the open High incidents across all workspaces."
-> "Extract the indicators from the newest one and summarize the risk."
-> "Add a comment to that incident with your findings."
+The snippet points at this install's Python and sets `PYTHONPATH`, so the client
+can start the server from any folder. On Windows use `.\run-mcp.ps1` wherever
+you see `./run-mcp.sh`.
 
-## Everyday use
+## 6. Use it
 
-- `az login` sessions expire (typically after your tenant's policy, often ~90 days
-  of inactivity, sooner with Conditional Access). If tools start failing with 401,
-  run `az login --tenant <managing-tenant-id>` again and retry.
-- **Triage claims the incident for you.** `sentinel_triage_incident` first assigns an
-  unassigned incident to you (Sentinel's owner field is the lock, and the write is
-  ETag-conditional), so two analysts can't both end up triaging the same incident:
-  if a colleague already owns it you get *ALREADY_ASSIGNED* with their name instead
-  of a duplicate investigation, and if it was AI-triaged in the last 30 minutes you
-  get *RECENTLY_TRIAGED* pointing at the existing findings. Add `force=true` to run
-  anyway (it never takes ownership away from anyone). Status changes and assignments
-  are ETag-protected too: a concurrent edit returns *CONFLICT* — re-read and retry.
-- Closing / reclassifying is marked destructive, so the client asks you to confirm
-  first, and closing always requires a classification. To close a false positive,
-  set status *Closed* with classification *FalsePositive* and a reason.
-- Everything you do is attributed to you: audit comments read
-  *"Your Name (you@mssp.example) via AI SOC Agent (MCP)"*, and Azure records your
-  identity in the customer's activity log.
+Ask your client things like:
 
-## What triage actually looks at
+- "List the open High incidents across all workspaces."
+- "Open the newest one and extract its indicators."
+- "Which tables does the Fabrikam workspace ingest?"
+- "Hunt this incident" / "Show me the hunts you would run" (dry run with the KQL).
+- "Run a KQL query for failed sign-ins in that workspace over the last 24 hours."
+- "Triage this incident."
+- "Add a comment with our conclusion." / "Close it as a false positive, reason: authorized scanner."
+
+**What triage does.** `sentinel_triage_incident` claims the incident for you if it
+is unassigned, extracts the entities, checks threat intel, reads which tables the
+workspace ingests and runs the matching hunts from the catalog. Because no model
+runs on your laptop, it then returns an **evidence pack** (`status:
+EVIDENCE_COLLECTED`, `verdict: null`): the hunt results with their exact KQL, intel
+results, data coverage and gaps, alerts and comments. **Your MCP client is the
+analyst's AI**: it reasons over that evidence, proposes TRUE / FALSE POSITIVE or
+ESCALATE with the gaps named, and records the conclusion with
+`sentinel_add_comment`. (If the admin configures a server-side Azure OpenAI
+deployment, the server writes the verdict itself and posts it as a comment.)
+
+**No collisions between analysts.** Sentinel's incident *owner* is the lock. If a
+colleague already owns the incident you get `ALREADY_ASSIGNED` with their name; if
+it was AI-triaged in the last 30 minutes you get `RECENTLY_TRIAGED` pointing at the
+existing findings; `force=true` runs anyway without taking ownership. Status
+changes and assignments are ETag-protected: a concurrent edit returns `CONFLICT` —
+re-read and retry.
+
+**Closing** is marked destructive, so the client asks you to confirm, and closing
+always requires a classification (for a false positive: status *Closed*,
+classification *FalsePositive*, a reason).
+
+## 7. What triage actually looks at
 
 Triage and `sentinel_hunt_incident` don't run a fixed pair of queries. For each
 incident the server first reads the workspace's **`Usage`** table to learn which
@@ -159,29 +174,65 @@ indicators the incident has — accounts, IPs, hosts, hashes, URLs, apps, resour
 | Security logs | `SecurityEvent`, `OfficeActivity`, `CommonSecurityLog`, `Syslog` | Windows logon / process / account events, M365 operations, firewall & proxy sessions, Linux auth |
 | Alerts & TI | `SecurityAlert`, `ThreatIntelIndicators`, `ThreatIntelligenceIndicator` | other alerts naming the same entities; TI matches on IPs, URLs, domains, hashes |
 
-- Tables your customer doesn't ingest are **skipped and listed** as such, so the
-  report says what it could *not* see. If the `Usage` table can't be read, every
-  applicable hunt runs and a missing table shows up as a `TABLE_NOT_FOUND` error.
-- Every hunt result carries its exact KQL. Ask for a dry run ("show me the hunts you
-  would run") to get the queries without executing them, or refine one with
-  `sentinel_run_kql`.
-- Outside demo mode a failed query is reported as an error (`TABLE_NOT_FOUND`,
-  `QUERY_INVALID`, `FORBIDDEN`…), never replaced with sample rows.
+- Tables the customer doesn't ingest are **skipped and listed**, so the result says
+  what it could *not* see. If `Usage` can't be read, every applicable hunt runs and
+  a missing table shows up as a `TABLE_NOT_FOUND` error on that hunt.
+- Every hunt result carries its exact KQL; refine it with `sentinel_run_kql`.
+- A failed query is reported (`TABLE_NOT_FOUND`, `QUERY_INVALID`, `FORBIDDEN`…),
+  never replaced with sample rows.
 - Need another pivot? Add a `Hunt(...)` to the catalog: table(s), indicator kinds,
-  window, purpose, KQL template. It's picked up by triage and the MCP tool automatically.
+  window, purpose, KQL template. Triage and the MCP tool pick it up automatically.
 
-## Troubleshooting
+## 8. If something fails
+
+Every tool error is an object with `error`, `message`, `what_to_check` and, when
+it isn't yours to fix, `tell_admin` — the exact sentence to send. Your MCP client
+will show these to you; here is what they mean:
+
+| `error` | What happened | You | Tell the admin |
+|---------|---------------|-----|----------------|
+| `NOT_AUTHENTICATED` | No Azure token: `az login` expired or is for another tenant | `az login --tenant <managing-tenant-id>`, then `--check` | — |
+| `FLEET_NOT_CONFIGURED` | `workspaces.json` missing/empty | `./run-mcp.sh --discover-workspaces` | — |
+| `WORKSPACE_UNKNOWN` | A workspace id that isn't in your file | Use `sentinel_list_workspaces`; re-run discovery if the customer is new | — |
+| `FORBIDDEN` (403) | No Sentinel Responder on that workspace | Check `az account show` is the managing tenant; if only one customer fails it's their delegation | Yes — paste `tell_admin` (names the customer) |
+| `WORKSPACE_NOT_FOUND` (404) | Stale coordinates (renamed / moved / offboarded) | Re-run discovery | If it still 404s |
+| `INCIDENT_NOT_FOUND` | Wrong or deleted incident ref | Use the ref from `sentinel_list_incidents` | — |
+| `CONFLICT` | Someone changed the incident a moment ago | Re-read, then retry | — |
+| `ALREADY_ASSIGNED` / `RECENTLY_TRIAGED` | Not an error: a colleague has it | Coordinate, or `force=true` | — |
+| `THROTTLED` (429) | Azure rate limit | Wait a minute; query one workspace instead of `all` | — |
+| `AZURE_UNAVAILABLE` (5xx) | Azure-side problem | Retry later; check status.azure.com | If it persists |
+| `NETWORK` / `NETWORK_TIMEOUT` | Can't reach Azure | VPN / proxy must allow management.azure.com, login.microsoftonline.com, api.loganalytics.io | If your network needs an allow-list |
+| KQL `TABLE_NOT_FOUND` / `QUERY_INVALID` | Table not ingested / bad KQL | Check `sentinel_list_tables`; fix the query | A catalog hunt that fails everywhere (one-line fix) |
+| `NOT_CONFIGURED` (threat intel) | No AbuseIPDB / VirusTotal key on this server | Use your other intel tool; optional key in `.env` | — |
+| `EVIDENCE_COLLECTED` (triage) | Not an error: no server LLM, your client reasons over the evidence | Ask the client for its verdict | — |
+| `UNEXPECTED` | A bug or environment problem | Re-run `--check` | Yes — `--check` block + the error block |
+
+`--check` problems and fixes:
 
 | Symptom | Fix |
 |---------|-----|
-| `--check` says *NOT LIVE - no usable credentials* | `.env` has `DEMO_MODE=False` and `AZURE_AUTH_MODE=user`? Then run `az login --tenant <managing-tenant-id>`. |
-| *Signed in as: FAILED to obtain an ARM token* | No CLI session for that tenant: `az login --tenant …`. On Windows make sure `az` is on PATH for the same user. |
-| A workspace shows `403` | `lighthouse-sentinel-responders` isn't authorized on that customer's delegation (or you've dropped out of the group). Ask the admin. |
-| A workspace shows `404` | Typo in the fleet file (subscription id / resource group / workspace name). |
-| `--check` says *fleet file not found* / only sample workspaces load | Run `./run-mcp.sh --discover-workspaces`, or point `WORKSPACES_CONFIG_PATH` at your file (relative paths resolve against the `backend` folder). |
-| Discovery finds fewer customers than you expect | Resource Graph only returns what your account can read: ask the admin to confirm the `lighthouse-sentinel-responders` delegation covers that customer. |
+| *NOT LIVE - no usable credentials* | `.env` has `DEMO_MODE=False` and `AZURE_AUTH_MODE=user`? Then `az login --tenant <managing-tenant-id>`. |
+| *FAILED to obtain an ARM token (…)* | The bracket has azure-identity's reason: no CLI session (`az login`), `az` not on PATH (reopen the terminal / reinstall), or wrong tenant. |
+| *token tenant … differs from AZURE_TENANT_ID* | `az login --tenant <managing-tenant-id>` |
+| A workspace shows `403` | `lighthouse-sentinel-responders` isn't authorized on that customer's delegation. Send the line to the admin. |
+| A workspace shows `404` | Re-run `--discover-workspaces`. |
+| *KQL: FAILED … FORBIDDEN* | Your role reaches incidents but not log data — unusual with Sentinel Responder; send the block to the admin. |
+| *fleet file not found* / fewer customers than expected | Run `--discover-workspaces`. It lists only what your account can read, so a missing customer means a missing delegation — tell the admin which. |
+| Tools stop working after days | `az login` expired. Sign in again; nothing else changes. |
 | Windows: *running scripts is disabled* | `powershell -ExecutionPolicy Bypass -File .\run-mcp.ps1 --check` |
-| Browser login wanted instead of CLI | set `AZURE_INTERACTIVE_LOGIN=True` (opens a browser when no CLI session exists). |
+| The client says the server didn't start | Run `./run-mcp.sh --check` in a terminal; the client swallows startup errors, the terminal shows them. |
+
+**What to send the admin:** the `--- sentinel-mcp check ---` block from `--check`
+(or the tool's error block incl. `tell_admin`), the workspace id / incident ref,
+and what you asked the client to do. No secrets are in any of it.
+
+## 9. Updating
+
+```bash
+cd ai-soc-agent-for-microsoft-sentinel && git pull && cd backend
+source venv/bin/activate && pip install -r requirements.txt     # Windows: .\venv\Scripts\Activate.ps1
+./run-mcp.sh --check
+```
 
 ## For the SOC admin: rolling this out
 
@@ -192,13 +243,16 @@ indicators the incident has — accounts, IPs, hosts, hashes, URLs, apps, resour
    tenant once; Lighthouse projects every delegated workspace into that session.
 2. **Fleet file**: analysts generate their own with `--discover-workspaces`
    (Azure Resource Graph, scoped to what their account can read). If you prefer a
-   curated list, publish `workspaces.json` yourself — it holds workspace
-   coordinates only, no secrets.
-3. **Updates**: analysts `git pull` and re-run `--check`. Pinning a release tag
+   curated list, publish `workspaces.json` yourself — coordinates only, no secrets.
+3. **No sample data, no invented verdicts**: `DEMO_MODE=False` is the default. A
+   failed call is an error with `tell_admin`; triage without a server LLM is an
+   evidence pack. If you want server-side verdicts, set the Azure OpenAI values in
+   `.env` on the analysts' machines (or host the server — see `MCP_SERVER.md`).
+4. **Updates**: analysts `git pull` and re-run `--check`. Pinning a release tag
    avoids surprise changes.
-4. **Audit**: actions land in Sentinel comments under the analyst's identity and in
+5. **Audit**: actions land in Sentinel comments under the analyst's identity and in
    the customer tenant's Azure Activity Log; the local server keeps no state worth
-   backing up (triage reports are in-memory).
-5. **Branch rule**: this code lives on `analyst-local` only. **Never push it to
+   backing up.
+6. **Branch rule**: this code lives on `analyst-local` only. **Never push it to
    `main`** (the hosted web console) or merge `main` back in. Opt-in guard for your
    clone: `git config core.hooksPath .githooks` makes git refuse a push to `main`.

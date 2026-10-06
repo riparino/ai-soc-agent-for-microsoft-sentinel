@@ -6,7 +6,7 @@ Future) and cloud-security (Wiz) MCP servers — so the orchestrator can chain:
 
 > *Sentinel incident → extract indicators → enrich IPs/hashes with threat intel →
 > look up hosts/resources in cloud inventory → write findings back to the incident
-> → classify / remediate.*
+> → classify / close.*
 
 Copilot Studio facts this guide relies on (verified against Microsoft Learn):
 
@@ -37,10 +37,9 @@ MCP_DISABLED_TOOLS="sentinel_check_ip_reputation,sentinel_check_file_hash"
 
 What remains is purely Sentinel: `sentinel_list_workspaces`, `sentinel_list_incidents`,
 `sentinel_get_incident`, **`sentinel_extract_indicators`** (flat IOC lists for
-hand-off), `sentinel_list_tenant_users`, `sentinel_triage_incident`,
+hand-off), `sentinel_list_tables`, `sentinel_hunt_incident`, `sentinel_triage_incident`,
 `sentinel_get_triage_report`, `sentinel_run_kql`, `sentinel_add_comment`,
-`sentinel_update_incident_status`, `sentinel_assign_incident`,
-`sentinel_remediate_incident`.
+`sentinel_update_incident_status`, `sentinel_assign_incident`.
 
 ## 1. Host the server on a public HTTPS URL
 
@@ -75,13 +74,13 @@ the server still enforces Entra bearer tokens.)
 
 ### b) Azure Container Apps — for the team
 
-Build the existing image and run it with the MCP command (same image as the web
-app; only the entrypoint differs):
+Build an image from `backend/` (a minimal Dockerfile: `python:3.11-slim`, copy
+`backend/`, `pip install -r requirements.txt`) and run it with the MCP command:
 
 ```bash
-az acr build -r <acr> -t sentinel-soc-agent:latest .
+az acr build -r <acr> -t sentinel-soc-mcp:latest ./backend
 az containerapp create -n sentinel-soc-mcp -g <rg> --environment <aca-env> \
-  --image <acr>.azurecr.io/sentinel-soc-agent:latest \
+  --image <acr>.azurecr.io/sentinel-soc-mcp:latest \
   --command python --args "-m" "app.mcp_server" "--transport" "streamable-http" "--host" "0.0.0.0" \
   --ingress external --target-port 8800 \
   --secrets azure-client-secret=<sp-secret> \
@@ -94,8 +93,8 @@ az containerapp create -n sentinel-soc-mcp -g <rg> --environment <aca-env> \
 ```
 
 Mount `workspaces.json` as a secret volume (or use `WORKSPACES_JSON`). Container
-Apps terminates TLS, so `MCP_PUBLIC_URL` is `https://<app-fqdn>/mcp`. (AKS works
-the same way: a second Deployment with that `command`, exposed under `/mcp`.)
+Apps terminates TLS, so `MCP_PUBLIC_URL` is `https://<app-fqdn>/mcp`. (Any
+container platform works the same way: run that command, expose port 8800 under `/mcp`.)
 
 ## 2. Register two Entra apps
 
@@ -163,15 +162,18 @@ When asked to investigate or triage a Sentinel incident:
    hashes, URLs and Azure resources as lists.
 3. Enrich: send IPs, hashes and URLs to Recorded Future; send hosts and
    azure_resources to Wiz for asset ownership, exposure and criticality.
-4. Optionally call sentinel_triage_incident for the AI verdict and RCA, and
-   sentinel_run_kql (with the incident's workspaceId) for targeted hunts.
+4. Call sentinel_hunt_incident (or sentinel_triage_incident) for the entity-driven
+   hunts across the tables the workspace ingests; if triage returns an evidence
+   pack (verdict null) you reason over kql_findings and threat_intel yourself.
+   Use sentinel_run_kql (with the incident's workspaceId) for targeted follow-ups.
 5. Summarize: verdict, confidence, key evidence (cite the intel and asset findings),
    recommended actions. Then call sentinel_add_comment to record the enrichment
    summary on the incident.
-6. Only change status/classification or run remediation after the analyst
-   explicitly confirms. Closing requires a classification. If a remediation
-   returns BLOCKED_GRAPH_SCOPE, explain that identity actions are not available
-   for that delegated tenant and suggest the documented alternatives.
+6. Only change status/classification after the analyst explicitly confirms.
+   Closing requires a classification. If any tool returns an object with an
+   "error" field, relay its message, what_to_check and tell_admin to the analyst
+   verbatim and do not invent data to fill the gap. There are no identity or
+   endpoint actions here (Lighthouse does not delegate Graph / Defender XDR).
 
 Incident refs look like "<workspace_id>::<guid>"; never invent them. Empty
 parameter values mean "not set".

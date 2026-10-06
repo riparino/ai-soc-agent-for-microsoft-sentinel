@@ -26,9 +26,6 @@
       "subscription_id": "55555555-5555-5555-5555-555555555555",
       "resource_group": "rg-sentinel-fabrikam",
       "workspace_name": "fabrikam-sentinel",
-      "graph_tenant_id": "44444444-4444-4444-4444-444444444444",
-      "graph_client_id": "66666666-6666-6666-6666-666666666666",
-      "graph_client_secret": "<per-customer-graph-app-secret>",
       "_comment": "Delegated via Lighthouse AND has a per-customer Graph app registration with admin consent, so identity read/write features are fully enabled for this tenant."
     }
   ]

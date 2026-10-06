@@ -1,9 +1,10 @@
-# MCP Server — use the SOC Agent from Claude, GitHub Copilot & Copilot Studio
+# MCP Server — Sentinel as tools for Claude, GitHub Copilot & Copilot Studio
 
-`app/mcp_server.py` exposes the agent's capabilities as **Model Context Protocol
-(MCP)** tools, so analysts can drive fleet-wide Sentinel triage from the chat and
-coding assistants they already use. It reuses the same services as the web
-workbench (fleet registry, Sentinel client, KQL runner, triage agent) — nothing is duplicated, and the triage report cache is shared.
+`app/mcp_server.py` exposes Microsoft Sentinel — across the Lighthouse-delegated
+workspace fleet — as **Model Context Protocol (MCP)** tools. On the `analyst-local`
+branch it is the whole product: each analyst runs it on their own machine (see
+[ANALYST_LOCAL_SETUP.md](ANALYST_LOCAL_SETUP.md)); the same server can later be
+hosted for a team or a Copilot Studio agent over HTTP with Entra ID auth.
 
 ## Two ways to run it
 
@@ -12,9 +13,10 @@ workbench (fleet registry, Sentinel client, KQL runner, triage agent) — nothin
 | **stdio** | Local, single user, zero network. Claude Desktop / Claude Code / VS Code launch it as a subprocess. Best for testing. | `./run-mcp.sh` (= `python -m app.mcp_server --transport stdio`) |
 | **Streamable HTTP** | Shared/remote: Copilot Studio, Claude Enterprise connectors, teams. | `./run-mcp.sh --transport streamable-http` → `http://127.0.0.1:8800/mcp` |
 
-Settings come from `backend/.env` (same file as the web app). `DEMO_MODE=true`
-runs against the seeded two-workspace fleet with no Azure at all — ideal for
-trying the tools.
+Settings come from `backend/.env`. `DEMO_MODE=True` runs against a built-in
+two-workspace sample fleet with no Azure at all — for trying the tools only. With
+`DEMO_MODE=False` (the default) nothing is ever simulated: a failed call returns a
+structured error (see *Error contract* below) rather than sample data.
 
 ## Tools
 
@@ -29,7 +31,7 @@ call routes to the right delegated tenant. Always get refs from
 | `sentinel_list_incidents` | read | Compact summaries across one / several / `all` workspaces; filters + `limit` |
 | `sentinel_get_incident` | read | Full entity graph, alerts, comments, classification |
 | `sentinel_extract_indicators` | read | Flat, deduped IOC lists (ips, hosts, accounts, hashes, urls, azure_resources…) for hand-off to intel / asset tools |
-| `sentinel_triage_incident` | write | Claims the incident for the analyst (if unassigned), then runs the investigation → verdict, MITRE, evidence, RCA; returns `ALREADY_ASSIGNED` / `RECENTLY_TRIAGED` instead of duplicating work (`force` to override) |
+| `sentinel_triage_incident` | write | Claims the incident for the analyst (if unassigned), runs intel + the hunt catalog, then returns a verdict (server LLM configured) or an **evidence pack** (`EVIDENCE_COLLECTED`, verdict null) for the MCP client to reason over; `ALREADY_ASSIGNED` / `RECENTLY_TRIAGED` instead of duplicating work (`force` to override) |
 | `sentinel_get_triage_report` | read | Fetch an existing report |
 | `sentinel_list_tables` | read | Which tables the workspace ingests (from `Usage`) and which catalog hunts that supports |
 | `sentinel_hunt_incident` | read | Runs the entity-driven hunt catalog (Entra sign-in / audit / risk, Defender XDR Device* / Identity / Email / CloudApp, AzureActivity, AzureDiagnostics, SecurityEvent, Office, CEF, Syslog, alerts, TI) for an incident; `dry_run` returns the KQL only |
@@ -201,28 +203,37 @@ Put it behind HTTPS (ingress / App Gateway / Container Apps). The server:
 Each client authenticates **as the analyst** (delegated scope), so actions are
 attributable per person in the incident audit comments.
 
-## Deploying alongside the web app
+## Error contract (what analysts see when something fails)
 
-Run it as a second process/container from the same image:
+Every tool runs inside a guard. A failure is returned as:
 
-```yaml
-# docker-compose.yml (additional service)
-sentinel-soc-mcp:
-  build: .
-  command: ["python", "-m", "app.mcp_server", "--transport", "streamable-http", "--host", "0.0.0.0"]
-  ports: ["8800:8800"]
-  env_file: ./backend/.env
-  volumes:
-    - ./backend/workspaces.json:/etc/sentinel/workspaces.json:ro
-  # The image's HEALTHCHECK probes the web app on :8000, which this container
-  # doesn't run; disable it so Compose doesn't mark the MCP service unhealthy.
-  healthcheck:
-    disable: true
+```json
+{"error": "FORBIDDEN",
+ "message": "Azure refused the call (403): ana@mssp.example has no Microsoft Sentinel Responder access on workspace 'fabrikam'.",
+ "what_to_check": ["Confirm `az account show` is the managing tenant, not a customer tenant.", "..."],
+ "tell_admin": "Workspace 'fabrikam' (subscription ..., resource group ..., workspace ...) returns 403 for ana@mssp.example. The Lighthouse delegation ...",
+ "workspace": "fabrikam", "incident_ref": "fabrikam::...", "http_status": 403, "detail": "..."}
 ```
 
-On AKS, add a second Deployment/Service using the same ConfigMap/Secret/fleet
-Secret as the web app with that `command`, and expose it on your ingress under
-`/mcp`.
+Codes: `NOT_AUTHENTICATED`, `FLEET_NOT_CONFIGURED`, `WORKSPACE_UNKNOWN`,
+`WORKSPACE_INCOMPLETE`, `FORBIDDEN`, `WORKSPACE_NOT_FOUND`, `INCIDENT_NOT_FOUND`,
+`CONFLICT`, `THROTTLED`, `AZURE_UNAVAILABLE`, `AZURE_ERROR`, `NETWORK`,
+`NETWORK_TIMEOUT`, `UNEXPECTED` (bug / environment; traceback on stderr).
+`sentinel_list_incidents` keeps going when one customer fails and lists that
+workspace under `workspace_errors`. KQL results use `status: ERROR` with
+`error_type` (`TABLE_NOT_FOUND`, `QUERY_INVALID`, `FORBIDDEN`, `NOT_AUTHENTICATED`,
+`TIMEOUT`, `QUERY_FAILED`); intel lookups use `NOT_CONFIGURED` / `ERROR`. The
+server instructions tell the MCP client to relay `message`, `what_to_check` and
+`tell_admin` verbatim and never to invent data to fill a gap. Implementation:
+`app/services/errors.py`.
+
+## Hosting it for a team (later)
+
+Run the HTTP transport from the same code on any container platform
+(`python -m app.mcp_server --transport streamable-http --host 0.0.0.0`) with
+`MCP_AUTH_MODE=entra`, a service principal or managed identity (`AZURE_AUTH_MODE`),
+and the fleet file mounted read-only; put it behind HTTPS. Per-analyst attribution
+then comes from the delegated bearer token rather than from `az login`.
 
 ## Notes and limits
 
@@ -240,9 +251,8 @@ Secret as the web app with that `command`, and expose it on your ingress under
   `CONFLICT` rather than overwriting it. This works across every analyst's local
   server and the Sentinel portal because the state lives in Sentinel, not
   in any one process. Tune with `TRIAGE_CLAIM_ON_RUN` / `TRIAGE_DEDUPE_MINUTES`.
-- **Shared state**: the triage report cache is process-local (same as the web
-  app). Reports produced over MCP are visible in the web UI only when both run in
-  the same process; for multi-replica deployments back the store with Redis/Postgres.
+- **Shared state**: the triage result cache is process-local. For a multi-replica
+  hosted deployment back the store with Redis/Postgres.
 - **stdio = no auth by design**: it is a local subprocess channel; bearer auth is
   ignored for stdio. The server never writes anything but JSON-RPC to stdout (logs
   and the first-run banner go to stderr).

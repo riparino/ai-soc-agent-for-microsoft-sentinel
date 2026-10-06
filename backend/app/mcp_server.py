@@ -48,6 +48,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from app.config import settings
+from app.services.errors import SocError, from_exception
 from app.services.workspace_registry import workspace_registry, WORKSPACE_REF_SEPARATOR
 
 # Logging must go to stderr: on the stdio transport stdout is the protocol channel.
@@ -71,7 +72,13 @@ SERVER_INSTRUCTIONS = (
     "workspace ingests and sentinel_hunt_incident runs the catalog of entity-driven KQL "
     "hunts (Entra sign-in/audit/risk, Defender XDR Device*/Identity/Email/CloudApp, "
     "AzureActivity, AzureDiagnostics, SecurityEvent, Office, firewall, Syslog, alerts, TI) "
-    "for an incident. Scope is Microsoft Sentinel only (incidents, comments, "
+    "for an incident. sentinel_triage_incident claims the incident, runs the hunts and intel "
+    "lookups and returns a verdict when a server-side LLM is configured; otherwise it returns "
+    "an evidence pack (status EVIDENCE_COLLECTED, verdict null) and YOU reason over "
+    "kql_findings / threat_intel to reach the verdict and record it with sentinel_add_comment. "
+    "When any tool returns an object with an 'error' field, stop and explain it to the analyst "
+    "using its 'message', 'what_to_check' and 'tell_admin' fields verbatim - do not retry blindly "
+    "and never invent data to fill the gap. Scope is Microsoft Sentinel only (incidents, comments, "
     "status, assignment, Log Analytics KQL): there are no Entra ID / Microsoft Graph or "
     "Defender XDR actions, because Azure Lighthouse does not delegate those. Optional "
     "parameters use empty values ('' / 0 / []) to mean 'not set'."
@@ -310,10 +317,35 @@ def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
     from app.services.triage_store import TRIAGE_REPORTS_CACHE
 
     def tool(name: str, **kwargs: Any) -> Callable[[Callable], Callable]:
-        """Register with FastMCP unless the tool is disabled by configuration."""
-        if name in disabled:
-            return lambda fn: fn
-        return mcp.tool(name=name, **kwargs)
+        """Register with FastMCP unless the tool is disabled by configuration.
+
+        Every tool runs inside the error guard: a ``SocError`` (auth, 403 on a
+        customer delegation, stale fleet file, Azure outage...) is returned as the
+        structured error block (``error`` / ``message`` / ``what_to_check`` /
+        ``tell_admin``), and any other exception becomes ``UNEXPECTED`` with the
+        same shape and a full traceback on stderr. The analyst always gets a
+        readable result instead of a raw stack trace or a hung client.
+        """
+        import functools
+
+        def decorate(fn: Callable) -> Callable:
+            if name in disabled:
+                return fn
+
+            @functools.wraps(fn)
+            async def guarded(*args: Any, **kw: Any) -> Any:
+                try:
+                    return await fn(*args, **kw)
+                except SocError as e:
+                    logger.warning("%s -> %s: %s", name, e.code, e.message)
+                    return e.to_dict()
+                except Exception as e:  # noqa: BLE001 - last line of defence for the analyst
+                    logger.exception("%s failed unexpectedly", name)
+                    return from_exception(e, incident_ref=kw.get("incident_ref"), workspace=kw.get("workspace") or None).to_dict()
+
+            return mcp.tool(name=name, **kwargs)(guarded)
+
+        return decorate
 
     # ---------------------------------------------------------------- fleet
     @tool("sentinel_list_workspaces", title="List Sentinel workspaces", annotations=READ_ONLY)
@@ -346,9 +378,10 @@ def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
         pass that ``id`` as ``incident_ref`` to the other incident tools. Use
         sentinel_get_incident for the full entity graph, alerts, and comments.
         """
-        incidents = await sentinel_client.list_incidents(
+        listing = await sentinel_client.list_incidents_detailed(
             filter_status=_opt(status), severity=_opt(severity), time_range_days=days or None, workspace=workspace
         )
+        incidents = listing["incidents"]
         page = incidents[:limit]
         per_workspace: dict[str, int] = {}
         for inc in incidents:
@@ -356,6 +389,8 @@ def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
             per_workspace[wid] = per_workspace.get(wid, 0) + 1
         return {
             "total": len(incidents),
+            "workspaces_queried": listing.get("workspaces_queried"),
+            "workspace_errors": listing.get("errors", []),
             "count": len(page),
             "truncated": len(incidents) > len(page),
             "workspace_selector": workspace,
@@ -409,12 +444,16 @@ def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
         triage comment was posted within the dedupe window you get ``RECENTLY_TRIAGED``
         pointing at the existing findings. Pass ``force=true`` to run anyway.
 
-        The agent extracts entities, checks threat intelligence, runs KQL hunts against the
-        incident's own workspace, and produces a verdict (TRUE_POSITIVE / FALSE_POSITIVE /
-        SUSPICIOUS_ESCALATE) with confidence, MITRE ATT&CK mapping, evidence, recommended
-        actions, and a root-cause analysis. When AUTO_POST_COMMENTS_TO_SENTINEL is enabled
-        the summary is also posted back to the incident as a comment in its tenant.
-        Can take 10-60 seconds. Use sentinel_get_triage_report to fetch an existing report.
+        The agent extracts entities, checks threat intelligence, and runs the hunt catalog
+        against the incident's own workspace (tables discovered from Usage). If a server-side
+        LLM is configured it returns a verdict (TRUE_POSITIVE / FALSE_POSITIVE /
+        SUSPICIOUS_ESCALATE) with confidence, MITRE mapping, evidence and recommended
+        actions, and posts the summary as an incident comment. If not (the normal local
+        setup), it returns status EVIDENCE_COLLECTED with verdict null: kql_findings,
+        threat_intel, data_coverage, alerts and comments - reason over that evidence yourself,
+        cite only SUCCESS hunts with rows, name the visibility gaps, and record your conclusion
+        with sentinel_add_comment. Nothing is ever simulated: failed hunts carry error_type.
+        Can take 10-60 seconds. Use sentinel_get_triage_report to fetch an existing result.
         """
         from app.services.azure_credentials import get_signed_in_identity
         from app.services.triage_coordinator import run_coordinated_triage
@@ -710,42 +749,75 @@ def run_check(check_workspaces: bool = True) -> int:
     from app.services.azure_credentials import get_signed_in_identity, resolve_auth_mode
     from app.services.sentinel_client import sentinel_client
 
+    import os
+    import platform
+    from importlib.metadata import PackageNotFoundError, version as pkg_version
+
     ok = True
     out: list[str] = []
+    problems: list[str] = []          # one-line items for the "send this to your admin" block
     mode = resolve_auth_mode()
+    env_path = os.path.join(BACKEND_DIR, ".env")
+    try:
+        mcp_ver = pkg_version("mcp")
+    except PackageNotFoundError:
+        mcp_ver = "missing"
     out.append("Sentinel AI SOC Agent MCP server - local check")
     out.append(f"  Backend dir   : {BACKEND_DIR}")
-    out.append(f"  Python        : {sys.executable}")
-    out.append(f"  DEMO_MODE     : {settings.DEMO_MODE}")
-    out.append(f"  Auth mode     : {mode}")
+    out.append(f"  Python        : {platform.python_version()} ({sys.executable})")
+    out.append(f"  mcp package   : {mcp_ver}")
+    if sys.version_info < (3, 11):
+        ok = False
+        out.append("    ! Python 3.11 or newer is required. Install it and recreate the venv.")
+        problems.append(f"Python {platform.python_version()} is too old (need 3.11+)")
+    if os.path.exists(env_path):
+        out.append(f"  .env          : {env_path}")
+    else:
+        out.append(f"  .env          : NOT FOUND at {env_path} - run: cp .env.example .env  (then set AZURE_TENANT_ID)")
+        if not settings.DEMO_MODE:
+            ok = False
+            problems.append("backend/.env missing")
+    out.append(f"  DEMO_MODE     : {settings.DEMO_MODE}" + ("   <- sample data only; set DEMO_MODE=False for real Sentinel" if settings.DEMO_MODE else ""))
+    out.append(f"  Auth mode     : {mode}" + ("" if mode == "user" or settings.DEMO_MODE else "   <- analysts should use AZURE_AUTH_MODE=user"))
+    if not settings.AZURE_TENANT_ID and not settings.DEMO_MODE:
+        out.append("    ! AZURE_TENANT_ID is empty: set it to the managing tenant id so az login tokens target the right tenant.")
 
     if settings.DEMO_MODE:
         out.append("  Azure         : not contacted (DEMO_MODE=True). Set DEMO_MODE=False for live Sentinel.")
     elif not sentinel_client.is_live:
         ok = False
-        out.append("  Azure         : NOT LIVE - no usable credentials. For a local analyst install set AZURE_AUTH_MODE=user and run `az login --tenant <managing-tenant-id>`.")
+        out.append("  Azure         : NOT LIVE - no usable credentials. For a local analyst install set AZURE_AUTH_MODE=user and run `az login --tenant <managing-tenant-id>`."
+                   + (f" ({sentinel_client.init_error})" if sentinel_client.init_error else ""))
+        problems.append("no usable Azure credentials (AZURE_AUTH_MODE / az login)")
     else:
+        sentinel_client._get_arm_token()          # populates token_error with azure-identity's own message
         identity = get_signed_in_identity(sentinel_client.credential)
         if identity:
             out.append(f"  Signed in as  : {identity.get('name')} <{identity.get('upn') or '-'}> ({identity.get('kind')}, tenant {identity.get('tenant_id')})")
+            if settings.AZURE_TENANT_ID and identity.get("tenant_id") and str(identity["tenant_id"]).lower() != settings.AZURE_TENANT_ID.lower():
+                ok = False
+                out.append(f"    ! token tenant {identity['tenant_id']} differs from AZURE_TENANT_ID {settings.AZURE_TENANT_ID}: run `az login --tenant {settings.AZURE_TENANT_ID}`")
+                problems.append("signed in to the wrong tenant")
         else:
             ok = False
-            out.append("  Signed in as  : FAILED to obtain an ARM token. Run `az login --tenant <managing-tenant-id>` (or check AZURE_AUTH_MODE / service-principal settings).")
+            detail = sentinel_client.token_error or "no token"
+            out.append(f"  Signed in as  : FAILED to obtain an ARM token ({detail[:160]}). Run `az login --tenant <managing-tenant-id>`.")
+            problems.append(f"cannot obtain ARM token: {detail[:120]}")
 
     fleet = workspace_registry.list_workspaces()
     source = workspace_registry._source
     out.append(f"  Workspaces    : {len(fleet)} loaded (source: {source})")
-    if not settings.DEMO_MODE and source in ("demo-seed", "legacy-single-workspace"):
+    if not settings.DEMO_MODE and source in ("unconfigured", "demo-seed", "legacy-single-workspace"):
         ok = False
         if settings.WORKSPACES_CONFIG_PATH:
-            out.append(f"    ! fleet file not found: WORKSPACES_CONFIG_PATH={settings.WORKSPACES_CONFIG_PATH!r}. Generate it with `python -m app.mcp_server --discover-workspaces`.")
+            out.append(f"    ! fleet file not found: WORKSPACES_CONFIG_PATH={settings.WORKSPACES_CONFIG_PATH!r}. Generate it with `./run-mcp.sh --discover-workspaces`.")
         else:
-            out.append("    ! no fleet configured (running on built-in sample workspaces). Set WORKSPACES_CONFIG_PATH and run `python -m app.mcp_server --discover-workspaces`.")
+            out.append("    ! no fleet configured. Set WORKSPACES_CONFIG_PATH=./workspaces.json in .env and run `./run-mcp.sh --discover-workspaces`.")
+        problems.append("fleet file (workspaces.json) missing")
     for w in fleet:
         out.append(f"    - {w.id:<24} {w.display_name}  [{'managing tenant' if w.is_managing_tenant else 'delegated'}]")
     if not fleet:
         ok = False
-        out.append("    (none) - set WORKSPACES_CONFIG_PATH to the fleet file you were given.")
 
     if check_workspaces and sentinel_client.is_live and fleet:
         token = sentinel_client._get_arm_token()
@@ -778,17 +850,47 @@ def run_check(check_workspaces: bool = True) -> int:
             for wid, status in results:
                 if status != "OK" and not status.startswith("SKIP"):
                     ok = False
+                    problems.append(f"workspace {wid}: {status}")
                 out.append(f"    - {wid:<24} {status}")
+
+            # Log Analytics query permission: one cheap query on the first reachable workspace.
+            first_ok = next((wid for wid, st in results if st == "OK"), None)
+            if first_ok:
+                from app.services.kql_runner import kql_runner
+
+                ws = workspace_registry.get(first_ok)
+                res = asyncio.run(kql_runner.execute_kql("print check=1", timespan_hours=1, workspace=ws))
+                if res.get("status") == "SUCCESS":
+                    out.append(f"  KQL           : OK (query ran on {first_ok} as you)")
+                else:
+                    ok = False
+                    out.append(f"  KQL           : FAILED on {first_ok}: {res.get('error_type')} - {str(res.get('error'))[:160]}")
+                    problems.append(f"KQL query refused on {first_ok}: {res.get('error_type')}")
 
     server = create_server(auth_mode="none")
     tool_names = sorted(t.name for t in asyncio.run(server.list_tools()))
     disabled = _split_csv(settings.MCP_DISABLED_TOOLS)
     out.append(f"  Tools         : {len(tool_names)} registered" + (f" ({len(disabled)} disabled via MCP_DISABLED_TOOLS)" if disabled else ""))
     llm = bool((settings.LLM_PROVIDER == "azure_openai" and settings.AZURE_OPENAI_ENDPOINT and settings.AZURE_OPENAI_API_KEY) or settings.OPENAI_API_KEY)
-    out.append(f"  Server LLM    : {'configured' if llm else 'not configured - fine for MCP use: your MCP client is the reasoning engine; sentinel_triage_incident uses the built-in deterministic engine'}")
+    out.append(f"  Server LLM    : {'configured (triage returns a verdict)' if llm else 'not configured - normal for analysts: triage returns an evidence pack and your MCP client reasons over it'}")
+    ti = [n for n, v in (("AbuseIPDB", settings.ABUSEIPDB_API_KEY), ("VirusTotal", settings.VIRUSTOTAL_API_KEY)) if v]
+    out.append(f"  Threat intel  : {', '.join(ti) if ti else 'no external providers configured (lookups return NOT_CONFIGURED; Sentinel TI tables still work)'}")
     out.append("")
-    out.append("READY" if ok else "NOT READY - fix the items above and re-run --check")
-    out.append("Next: python -m app.mcp_server --print-config claude-desktop   (or vscode / claude-code)")
+    if ok:
+        out.append("READY")
+        out.append("Next: ./run-mcp.sh --print-config claude-desktop   (or vscode / claude-code)")
+    else:
+        out.append("NOT READY - fix the items above and re-run --check")
+        out.append("")
+        out.append("If you are stuck, send your SOC admin this block:")
+        out.append("  --- sentinel-mcp check ---")
+        out.append(f"  python {platform.python_version()}, mcp {mcp_ver}, auth_mode {mode}, demo {settings.DEMO_MODE}")
+        who = get_signed_in_identity(sentinel_client.credential) if sentinel_client.is_live else None
+        out.append(f"  signed in: {(who or {}).get('upn') or 'none'}  tenant: {(who or {}).get('tenant_id') or settings.AZURE_TENANT_ID or 'unset'}")
+        out.append(f"  fleet: {len(fleet)} workspace(s) from {source}")
+        for p_ in problems:
+            out.append(f"  problem: {p_}")
+        out.append("  --------------------------")
     print("\n".join(out))
     return 0 if ok else 1
 

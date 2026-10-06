@@ -12,8 +12,7 @@ venv/
 backend/.env
 backend/workspaces.json
 
-# Node / frontend build
+
+# Node (no frontend on this branch, but keep installs out of git regardless)
 node_modules/
-frontend/node_modules/
-frontend/dist/
 dist/

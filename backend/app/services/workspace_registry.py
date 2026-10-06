@@ -8,8 +8,6 @@ instance. This module is the single source of truth for that fleet:
   * It loads up to ~hundreds of workspace coordinates from config or a JSON store.
   * It assigns every workspace a stable ``id`` used to namespace incident IDs so a
     request can be routed back to the workspace the incident belongs to.
-  * It records how Microsoft Graph must be handled per workspace, because Azure
-    Lighthouse does **not** delegate Microsoft Graph (identity) access.
 
 Workspace context is passed explicitly (as ``WorkspaceConfig`` objects) into the
 Sentinel/KQL clients rather than mutated onto a global settings singleton.
@@ -73,50 +71,11 @@ class WorkspaceConfig(BaseModel):
     resource_group: Optional[str] = None
     workspace_name: Optional[str] = None
     workspace_guid: Optional[str] = None  # Log Analytics customerId GUID
-
-    # Optional per-customer Microsoft Graph app registration. Azure Lighthouse does
-    # NOT cover Microsoft Graph, so reaching a customer tenant's directory requires
-    # either an app registered + admin-consented in that customer tenant, or scoping
-    # Graph features to the managing tenant. See graph_mode below.
-    graph_tenant_id: Optional[str] = None
-    graph_client_id: Optional[str] = None
-    graph_client_secret: Optional[str] = None
-
-    # True for the workspace that lives in the managing (home) tenant. The home
-    # service principal's Graph token can see this tenant's directory directly.
+    # True for the workspace that lives in the managing (home) tenant.
     is_managing_tenant: bool = False
 
     def has_arm_coordinates(self) -> bool:
         return bool(self.subscription_id and self.resource_group and self.workspace_name)
-
-    def has_delegated_graph_app(self) -> bool:
-        return bool(self.graph_tenant_id and self.graph_client_id and self.graph_client_secret)
-
-    @property
-    def graph_mode(self) -> str:
-        """
-        How Microsoft Graph (identity) features behave for this workspace:
-
-          * ``delegated-app``   - a per-customer app registration is configured, so
-            we can read/act on this tenant's directory directly.
-          * ``managing-tenant`` - this workspace is in the home tenant; the shared
-            home SP Graph token sees it directly.
-          * ``log-analytics-only`` - Lighthouse delegation covers ARM + Log
-            Analytics but NOT Graph, so directory data can only be derived from the
-            workspace's own SigninLogs/IdentityInfo telemetry and identity *write*
-            remediation is unavailable from this instance.
-        """
-        if self.has_delegated_graph_app():
-            return "delegated-app"
-        if self.is_managing_tenant:
-            return "managing-tenant"
-        return "log-analytics-only"
-
-    @property
-    def graph_write_capable(self) -> bool:
-        """Whether identity *write* actions (revoke sessions, disable account) can
-        reach this workspace's tenant from this instance."""
-        return self.graph_mode in ("delegated-app", "managing-tenant")
 
     def arm_base_url(self) -> str:
         """ARM SecurityInsights base URL for this workspace (Lighthouse-honored)."""
@@ -147,8 +106,6 @@ class WorkspaceConfig(BaseModel):
             "workspace_name": self.workspace_name,
             "workspace_guid": self.workspace_guid,
             "is_managing_tenant": self.is_managing_tenant,
-            "graph_mode": self.graph_mode,
-            "graph_write_capable": self.graph_write_capable,
         }
 
 
@@ -230,9 +187,12 @@ class WorkspaceRegistry:
             )
             return [legacy], "legacy-single-workspace"
 
-        # 4. Demo seed - multiple workspaces so routing/aggregation is demonstrable
-        #    even without any live Azure configuration.
-        return self._demo_seed(), "demo-seed"
+        # 4. Nothing configured. Only DEMO_MODE gets the built-in sample fleet; a live
+        #    install stays empty so tools report FLEET_NOT_CONFIGURED instead of
+        #    probing sample coordinates.
+        if settings.DEMO_MODE:
+            return self._demo_seed(), "demo-seed"
+        return [], "unconfigured"
 
     def _build_from_raw(self, raw) -> List[WorkspaceConfig]:
         if isinstance(raw, dict):
@@ -265,9 +225,6 @@ class WorkspaceRegistry:
                     resource_group=entry.get("resource_group") or entry.get("resource_group_name"),
                     workspace_name=entry.get("workspace_name"),
                     workspace_guid=entry.get("workspace_guid") or entry.get("workspace_id"),
-                    graph_tenant_id=entry.get("graph_tenant_id"),
-                    graph_client_id=entry.get("graph_client_id"),
-                    graph_client_secret=entry.get("graph_client_secret"),
                     is_managing_tenant=is_managing,
                 )
             )
@@ -315,7 +272,7 @@ class WorkspaceRegistry:
             return None
 
     def managing_workspace(self) -> Optional[WorkspaceConfig]:
-        """The home-tenant workspace (for Graph features scoped to the managing tenant)."""
+        """The workspace that lives in the managing (home) tenant, else the default."""
         with self._lock:
             for wid in self._order:
                 w = self._workspaces[wid]
