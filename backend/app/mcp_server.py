@@ -668,6 +668,46 @@ def client_config(target: str) -> str:
     raise ValueError(f"unknown client config target {target!r}; choose from {', '.join(CLIENT_CONFIG_TARGETS)}")
 
 
+def run_discover(out_path: Optional[str], include_all: bool, dry_run: bool) -> int:
+    """Generate / refresh the fleet file from Azure Resource Graph using the
+    current identity (the analyst's az login in user mode). Returns an exit code."""
+    from app.services import workspace_discovery as disc
+    from app.services.sentinel_client import sentinel_client
+    from app.services.workspace_registry import BACKEND_DIR as _BD, resolve_fleet_path
+
+    if settings.DEMO_MODE or not sentinel_client.is_live:
+        print("Discovery needs live Azure credentials: set DEMO_MODE=False and AZURE_AUTH_MODE=user, then `az login --tenant <managing-tenant-id>`.")
+        return 1
+    token = sentinel_client._get_arm_token()
+    if not token:
+        print("Could not obtain an Azure token. Run `az login --tenant <managing-tenant-id>` and retry.")
+        return 1
+
+    target = out_path or resolve_fleet_path(must_exist=False) or __import__("os").path.join(_BD, "workspaces.json")
+    try:
+        entries, stats = disc.discover(token, include_all=include_all)
+    except Exception as e:  # noqa: BLE001
+        print(f"Resource Graph query failed: {type(e).__name__}: {e}")
+        return 1
+    existing = disc.load_existing(target)
+    merged, summary = disc.merge_fleet(existing, entries) if existing else (entries, {"added": [e["id"] for e in entries], "updated": [], "missing": []})
+
+    print("Azure Resource Graph discovery (tenant scope, includes Lighthouse-delegated subscriptions)")
+    print(f"  Log Analytics workspaces visible : {stats['log_analytics_workspaces']} across {stats['subscriptions']} subscription(s) in {stats['tenants']} tenant(s)")
+    print(f"  Microsoft Sentinel enabled       : {stats['sentinel_workspaces']}" + ("" if include_all else "  (only these are written; add --include-all-workspaces to keep the rest)"))
+    print(f"  Fleet file                       : {target}{' (dry run - not written)' if dry_run else ''}")
+    print(f"  Added {len(summary['added'])} · refreshed {len(summary['updated'])} · kept-but-not-found {len(summary['missing'])}")
+    for wid in summary["missing"]:
+        print(f"    ! {wid}: not visible in Resource Graph - lost access, or the workspace is gone")
+    if dry_run:
+        print(disc.render_fleet_file(merged))
+        return 0
+    with open(target, "w", encoding="utf-8") as f:
+        f.write(disc.render_fleet_file(merged))
+    print(f"  Wrote {len(merged)} workspace(s). Next: python -m app.mcp_server --check")
+    return 0
+
+
 def run_check(check_workspaces: bool = True) -> int:
     """Self-diagnosis for a local (per-analyst) install. Prints a report to stdout
     and returns a process exit code (0 = ready)."""
@@ -699,7 +739,14 @@ def run_check(check_workspaces: bool = True) -> int:
             out.append("  Signed in as  : FAILED to obtain an ARM token. Run `az login --tenant <managing-tenant-id>` (or check AZURE_AUTH_MODE / service-principal settings).")
 
     fleet = workspace_registry.list_workspaces()
-    out.append(f"  Workspaces    : {len(fleet)} loaded (source: {workspace_registry._source})")
+    source = workspace_registry._source
+    out.append(f"  Workspaces    : {len(fleet)} loaded (source: {source})")
+    if not settings.DEMO_MODE and source in ("demo-seed", "legacy-single-workspace"):
+        ok = False
+        if settings.WORKSPACES_CONFIG_PATH:
+            out.append(f"    ! fleet file not found: WORKSPACES_CONFIG_PATH={settings.WORKSPACES_CONFIG_PATH!r}. Generate it with `python -m app.mcp_server --discover-workspaces`.")
+        else:
+            out.append("    ! no fleet configured (running on built-in sample workspaces). Set WORKSPACES_CONFIG_PATH and run `python -m app.mcp_server --discover-workspaces`.")
     for w in fleet:
         out.append(f"    - {w.id:<24} {w.display_name}  [graph_mode={w.graph_mode}]")
     if not fleet:
@@ -775,7 +822,14 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("--check", action="store_true", help="Self-diagnose a local install (auth, identity, fleet, workspace reachability, tools) and exit.")
     parser.add_argument("--no-workspace-probe", action="store_true", help="With --check: skip probing each workspace over ARM.")
     parser.add_argument("--print-config", choices=list(CLIENT_CONFIG_TARGETS), default=None, help="Print the MCP client configuration for this install and exit.")
+    parser.add_argument("--discover-workspaces", action="store_true", help="Generate/refresh the fleet file (workspaces.json) from Azure Resource Graph using your signed-in identity, then exit.")
+    parser.add_argument("--fleet-out", default=None, help="With --discover-workspaces: where to write the fleet file (default: WORKSPACES_CONFIG_PATH, else backend/workspaces.json).")
+    parser.add_argument("--include-all-workspaces", action="store_true", help="With --discover-workspaces: include Log Analytics workspaces that are not Sentinel-enabled.")
+    parser.add_argument("--dry-run", action="store_true", help="With --discover-workspaces: print the fleet file instead of writing it.")
     args = parser.parse_args(argv)
+
+    if args.discover_workspaces:
+        sys.exit(run_discover(args.fleet_out, args.include_all_workspaces, args.dry_run))
 
     if args.print_config:
         print(client_config(args.print_config))

@@ -28,6 +28,30 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Backend directory: relative WORKSPACES_CONFIG_PATH values resolve against it, so a
+# fleet file next to .env is found even when an MCP client launches the server from
+# an arbitrary working directory.
+BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def resolve_fleet_path(configured: Optional[str] = None, must_exist: bool = True) -> Optional[str]:
+    """Resolve the fleet file path: absolute as-is; relative first against the
+    current directory, then against the backend directory. Returns None when the
+    path is unset (or, with must_exist, when no candidate exists)."""
+    cfg = configured if configured is not None else settings.WORKSPACES_CONFIG_PATH
+    if not cfg or not str(cfg).strip():
+        return None
+    cfg = str(cfg).strip()
+    if os.path.isabs(cfg):
+        candidates = [cfg]
+    else:
+        candidates = [os.path.abspath(cfg), os.path.join(BACKEND_DIR, cfg)]
+    for cand in candidates:
+        if os.path.exists(cand):
+            return cand
+    return None if must_exist else candidates[-1]
+
+
 # Separator used to namespace incident IDs as "<workspace_id>::<raw_incident_id>".
 # ':' is a valid URL path character (pchar), so refs survive REST/WebSocket paths.
 WORKSPACE_REF_SEPARATOR = "::"
@@ -178,16 +202,19 @@ class WorkspaceRegistry:
             except Exception as e:
                 logger.error("Failed to parse WORKSPACES_JSON: %s", e)
 
-        # 2. JSON file path.
-        if settings.WORKSPACES_CONFIG_PATH and os.path.exists(settings.WORKSPACES_CONFIG_PATH):
+        # 2. JSON file path (relative paths resolve against cwd, then the backend dir).
+        fleet_path = resolve_fleet_path()
+        if fleet_path:
             try:
-                with open(settings.WORKSPACES_CONFIG_PATH, "r", encoding="utf-8") as f:
+                with open(fleet_path, "r", encoding="utf-8") as f:
                     raw = json.load(f)
                 parsed = self._build_from_raw(raw)
                 if parsed:
-                    return parsed, f"file:{settings.WORKSPACES_CONFIG_PATH}"
+                    return parsed, f"file:{fleet_path}"
             except Exception as e:
-                logger.error("Failed to load WORKSPACES_CONFIG_PATH: %s", e)
+                logger.error("Failed to load WORKSPACES_CONFIG_PATH (%s): %s", fleet_path, e)
+        elif settings.WORKSPACES_CONFIG_PATH:
+            logger.warning("WORKSPACES_CONFIG_PATH=%r does not exist; falling back.", settings.WORKSPACES_CONFIG_PATH)
 
         # 3. Legacy single-workspace AZURE_* configuration (managing tenant).
         if settings.AZURE_SUBSCRIPTION_ID and settings.AZURE_RESOURCE_GROUP_NAME and settings.AZURE_WORKSPACE_NAME:

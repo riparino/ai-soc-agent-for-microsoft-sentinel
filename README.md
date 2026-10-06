@@ -15,6 +15,7 @@
 > cd ai-soc-agent-for-microsoft-sentinel/backend
 > python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt   # Windows: .\venv\Scripts\Activate.ps1
 > cp .env.example .env    # set DEMO_MODE=False, AZURE_AUTH_MODE=user, AZURE_TENANT_ID, WORKSPACES_CONFIG_PATH
+> ./run-mcp.sh --discover-workspaces            # builds workspaces.json from Azure Resource Graph with your login
 > ./run-mcp.sh --check                          # Windows: .\run-mcp.ps1 --check
 > ./run-mcp.sh --print-config claude-desktop    # paste into your MCP client (or: vscode, claude-code)
 > ```

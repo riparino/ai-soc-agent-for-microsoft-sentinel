@@ -12,9 +12,12 @@ is recorded in Sentinel under your name.
 - Membership in the SOC analysts group that holds the Lighthouse authorizations
   (**Microsoft Sentinel Responder** + **Log Analytics Reader** on the customer
   subscriptions). Read-only role = you can list/triage but not comment or close.
-- The fleet file `workspaces.json` (customer subscription / resource group /
-  workspace names — no secrets).
+- Our managing tenant ID.
 - Python 3.11+, Git, and the **Azure CLI** (`az`).
+
+You generate the fleet file (`workspaces.json`) yourself in step 3 — it comes from
+Azure Resource Graph using your own login, so it lists exactly the customer
+workspaces you can see.
 
 ## Setup
 
@@ -55,7 +58,39 @@ OpenAI key either: when you use the server from Claude or Copilot, *that* model 
 the reasoning; the server's own `sentinel_triage_incident` falls back to its built-in
 deterministic engine unless you configure one.
 
-Put `workspaces.json` next to `.env` (or point `WORKSPACES_CONFIG_PATH` at it).
+### Generate the fleet file (`workspaces.json`)
+
+```bash
+./run-mcp.sh --discover-workspaces        # Windows: .\run-mcp.ps1 --discover-workspaces
+```
+
+This runs an **Azure Resource Graph** query at tenant scope with your `az login`
+identity. Resource Graph includes every Azure Lighthouse-delegated subscription you
+can read, so the result is the full list of customer Sentinel workspaces you have
+access to — subscription, resource group, workspace name, Log Analytics GUID and the
+customer tenant ID — written to `backend/workspaces.json` next to `.env`.
+
+- Re-run it any time a customer is onboarded or offboarded. It **merges**: ids,
+  display names and any per-customer Graph settings you edited by hand are kept,
+  coordinates are refreshed, new workspaces are appended, and workspaces you can no
+  longer see are kept but flagged.
+- `--dry-run` prints the file instead of writing it; `--include-all-workspaces` also
+  lists Log Analytics workspaces that aren't Sentinel-enabled.
+- Portal equivalent: in the Azure portal's **Microsoft Sentinel** (or Log Analytics
+  workspaces) list, **Open query** opens Azure Resource Graph Explorer with the same
+  data; **Run query → Download as CSV** gives you the list by hand. The tool just
+  saves you the CSV-to-JSON step. The query it runs:
+
+  ```kusto
+  resources
+  | where type =~ 'microsoft.operationalinsights/workspaces'
+  | join kind=inner (
+      resources
+      | where type =~ 'microsoft.operationsmanagement/solutions' and name startswith 'SecurityInsights('
+      | project id = tolower(tostring(properties.workspaceResourceId)))
+    on $left.['id'] == $right.['id']
+  | project name, resourceGroup, subscriptionId, tenantId, customerId = tostring(properties.customerId)
+  ```
 
 ### Check, then connect your client
 
@@ -101,7 +136,8 @@ on its own. Restart the client and try:
 | *Signed in as: FAILED to obtain an ARM token* | No CLI session for that tenant: `az login --tenant …`. On Windows make sure `az` is on PATH for the same user. |
 | A workspace shows `403` | Your account lacks a delegated role on that customer subscription — ask the admin to add you to the Lighthouse-authorized group. |
 | A workspace shows `404` | Typo in the fleet file (subscription id / resource group / workspace name). |
-| Client shows the server but tools error with *WORKSPACE_NOT_FOUND* | `WORKSPACES_CONFIG_PATH` doesn't resolve — use an absolute path. |
+| `--check` says *fleet file not found* / only sample workspaces load | Run `./run-mcp.sh --discover-workspaces`, or point `WORKSPACES_CONFIG_PATH` at your file (relative paths resolve against the `backend` folder). |
+| Discovery finds fewer customers than you expect | Resource Graph only returns what your account can read: ask the admin to confirm your SOC-Analysts membership covers that customer's delegation. |
 | Windows: *running scripts is disabled* | `powershell -ExecutionPolicy Bypass -File .\run-mcp.ps1 --check` |
 | Browser login wanted instead of CLI | set `AZURE_INTERACTIVE_LOGIN=True` (opens a browser when no CLI session exists). |
 
@@ -110,9 +146,10 @@ on its own. Restart the client and try:
 1. **Lighthouse**: assign Sentinel Responder + Log Analytics Reader to a security
    group (e.g. `SOC-Analysts`) in each customer delegation; add analysts to the
    group — no per-analyst Azure changes afterwards.
-2. **Fleet file**: publish `workspaces.json` with coordinates only. Do **not** put
-   per-customer `graph_client_secret` values in the analysts' copy; keep any
-   Graph app registrations on a central server deployment.
+2. **Fleet file**: analysts generate their own with `--discover-workspaces`
+   (Azure Resource Graph, scoped to what their account can read). If you prefer a
+   curated list, publish `workspaces.json` with coordinates only, and never put
+   per-customer `graph_client_secret` values in the analysts' copy.
 3. **Updates**: analysts `git pull` and re-run `--check`. Pinning a release tag
    avoids surprise changes.
 4. **Audit**: actions land in Sentinel comments under the analyst's identity and in
