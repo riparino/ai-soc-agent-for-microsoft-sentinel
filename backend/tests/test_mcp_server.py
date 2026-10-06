@@ -24,7 +24,6 @@ EXPECTED_TOOLS = {
     "sentinel_list_incidents",
     "sentinel_get_incident",
     "sentinel_extract_indicators",
-    "sentinel_list_tenant_users",
     "sentinel_triage_incident",
     "sentinel_get_triage_report",
     "sentinel_run_kql",
@@ -33,7 +32,6 @@ EXPECTED_TOOLS = {
     "sentinel_add_comment",
     "sentinel_update_incident_status",
     "sentinel_assign_incident",
-    "sentinel_remediate_incident",
 }
 
 
@@ -148,7 +146,6 @@ async def test_tools_are_registered_with_annotations(server):
     # Reads are flagged read-only; destructive actions are flagged destructive.
     assert tools["sentinel_list_incidents"].annotations.readOnlyHint is True
     assert tools["sentinel_get_incident"].annotations.readOnlyHint is True
-    assert tools["sentinel_remediate_incident"].annotations.destructiveHint is True
     assert tools["sentinel_update_incident_status"].annotations.destructiveHint is True
     assert tools["sentinel_add_comment"].annotations.destructiveHint is False
     # Required params surface in the schema so clients prompt for them.
@@ -163,8 +160,10 @@ async def test_list_workspaces(server):
         data = await _call(session, "sentinel_list_workspaces")
     ids = {w["id"] for w in data["workspaces"]}
     assert {"contoso", "fabrikam"} <= ids
-    modes = {w["id"]: w["graph_mode"] for w in data["workspaces"]}
-    assert modes["fabrikam"] == "log-analytics-only"
+    # Sentinel-only surface: no Microsoft Graph fields leak into the analyst tools.
+    for w in data["workspaces"]:
+        assert not any(k.startswith("graph") for k in w), w
+    assert {"tenant_id", "subscription_id", "resource_group", "workspace_name"} <= set(data["workspaces"][0])
 
 
 @pytest.mark.asyncio
@@ -267,22 +266,6 @@ async def test_add_comment_routes_to_incident(server):
     assert res["status"] == "SUCCESS"
     assert any(c.get("message") == "mcp test note" for c in inc["comments"])
 
-
-@pytest.mark.asyncio
-async def test_graph_scope_guardrail_applies_over_mcp(server):
-    async with create_connected_server_and_client_session(server) as session:
-        fab = await _call(session, "sentinel_list_incidents", workspace="fabrikam")
-        ref = fab["incidents"][0]["id"]
-        blocked = await _call(
-            session, "sentinel_remediate_incident",
-            incident_ref=ref, action_type="revoke_sessions", entity="user@fabrikam.example",
-        )
-        allowed = await _call(
-            session, "sentinel_remediate_incident",
-            incident_ref=ref, action_type="block_ip", entity="185.220.101.5",
-        )
-    assert blocked["status"] == "BLOCKED_GRAPH_SCOPE"
-    assert allowed["status"] == "SUCCESS"
 
 
 # ------------------------------------------------------------------- auth

@@ -460,10 +460,12 @@ cd backend
 MCP_AUTH_MODE=entra ./run-mcp.sh --transport streamable-http --host 0.0.0.0   # shared / remote
 ```
 
-- **13 tools**: list workspaces/incidents, get incident, run AI triage, fetch report,
-  KQL, threat intel, comment, status/classification, assign, remediate. Namespaced
-  incident refs route every call to the right delegated tenant; destructive tools
-  are annotated so clients confirm first, and the Graph/Lighthouse guardrail applies.
+- **12 tools, Sentinel only**: list workspaces/incidents, get incident, extract
+  indicators, run AI triage (claims the incident first), fetch report, KQL, threat
+  intel, comment, status/classification, assign. Namespaced incident refs route every
+  call to the right delegated tenant; destructive tools are annotated so clients
+  confirm first. No Entra ID / Microsoft Graph or Defender XDR actions — Lighthouse
+  doesn't delegate them.
 - **Local**: add `backend/run-mcp.sh` as a stdio server in Claude Code
   (`claude mcp add sentinel-soc -- /path/backend/run-mcp.sh`), Claude Desktop, or
   VS Code `.vscode/mcp.json`. Works fully in `DEMO_MODE` with no Azure.

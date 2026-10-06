@@ -2,7 +2,7 @@
 MCP server for the Microsoft Sentinel AI SOC Agent.
 
 Exposes the agent's capabilities (fleet-wide incident listing, triage, KQL hunts,
-threat intel, comments/status/assignment, guarded remediation) as Model Context
+threat intel, comments/status/assignment) as Model Context
 Protocol tools so they can be used from Claude (Enterprise connectors, Claude
 Desktop, Claude Code), GitHub Copilot (VS Code agent mode / coding agent), and
 Microsoft Copilot Studio.
@@ -67,10 +67,15 @@ SERVER_INSTRUCTIONS = (
     "Start with sentinel_list_workspaces to see the fleet. Use sentinel_extract_indicators "
     "to get an incident's IPs, hosts, accounts and hashes as flat lists for enrichment "
     "with other tools (threat intelligence, asset/cloud inventory), then record findings "
-    "with sentinel_add_comment. Identity actions (revoke sessions / disable account) are "
-    "refused for delegated tenants without a per-customer Microsoft Graph app because "
-    "Azure Lighthouse does not delegate Microsoft Graph. Optional parameters use empty "
-    "values ('' / 0 / []) to mean 'not set'."
+    "with sentinel_add_comment. Scope is Microsoft Sentinel only (incidents, comments, "
+    "status, assignment, Log Analytics KQL): there are no Entra ID / Microsoft Graph or "
+    "Defender XDR actions, because Azure Lighthouse does not delegate those. Optional "
+    "parameters use empty values ('' / 0 / []) to mean 'not set'."
+)
+
+WORKSPACE_PUBLIC_FIELDS = (
+    "id", "display_name", "tenant_id", "subscription_id", "resource_group",
+    "workspace_name", "workspace_guid", "is_managing_tenant",
 )
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
@@ -361,7 +366,6 @@ def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
     from app.services.sentinel_client import sentinel_client
     from app.services.kql_runner import kql_runner
     from app.services.threat_intel import threat_intel_service
-    from app.services.remediation_service import remediation_service
     # Shared with the REST/WebSocket API. Deliberately NOT imported from app.api.*
     # so this server never pulls in the HTTP/auth layer (whose import prints the
     # first-run credential banner — fatal on the stdio transport where stdout is
@@ -380,12 +384,13 @@ def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
         """List the managed Microsoft Sentinel workspace fleet (one entry per customer tenant).
 
         Returns each workspace's ``id`` (use it as the ``workspace`` selector in other
-        tools), display name, tenant/subscription coordinates, and ``graph_mode``:
-        ``managing-tenant`` / ``delegated-app`` allow identity actions; ``log-analytics-only``
-        means Microsoft Graph is not reachable for that tenant (Azure Lighthouse limitation).
+        tools), display name, and tenant/subscription/resource-group coordinates.
         Call this first to discover valid workspace ids.
         """
-        workspaces = [w.public_dict() for w in workspace_registry.list_workspaces()]
+        workspaces = [
+            {k: v for k, v in w.public_dict().items() if k in WORKSPACE_PUBLIC_FIELDS}
+            for w in workspace_registry.list_workspaces()
+        ]
         return {"count": len(workspaces), "workspaces": workspaces}
 
     # ------------------------------------------------------------ incidents
@@ -450,27 +455,6 @@ def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
         if not incident:
             return _not_found(incident_ref)
         return extract_indicators(incident)
-
-    @tool("sentinel_list_tenant_users", title="List tenant users for assignment", annotations=READ_ONLY)
-    async def sentinel_list_tenant_users(
-        workspace: Annotated[str, Field(description="Workspace id whose tenant directory to list. Empty = the managing tenant.")] = "",
-    ) -> dict[str, Any]:
-        """List SOC engineers / users for a workspace's tenant, for use with
-        sentinel_assign_incident.
-
-        Source depends on the workspace's ``graph_mode``: Microsoft Graph for the managing
-        tenant or a per-customer app; otherwise the workspace's own SigninLogs telemetry
-        (Azure Lighthouse does not delegate Microsoft Graph).
-        """
-        ws = workspace_registry.get(_opt(workspace)) if _opt(workspace) else None
-        users = await sentinel_client.get_entra_users(workspace=ws)
-        resolved = ws or workspace_registry.managing_workspace() or workspace_registry.default()
-        return {
-            "workspace_id": resolved.id if resolved else None,
-            "graph_mode": resolved.graph_mode if resolved else None,
-            "count": len(users),
-            "users": users,
-        }
 
     # --------------------------------------------------------------- triage
     @tool("sentinel_triage_incident", title="Run AI triage on an incident", annotations=WRITE_SAFE)
@@ -615,7 +599,7 @@ def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
     @tool("sentinel_assign_incident", title="Assign incident", annotations=WRITE_SAFE)
     async def sentinel_assign_incident(
         incident_ref: Annotated[str, Field(description=REF_DESCRIPTION, min_length=1)],
-        user_upn: Annotated[str, Field(description="UPN/email of the assignee (from sentinel_list_tenant_users). Leave all user fields empty to unassign.")] = "",
+        user_upn: Annotated[str, Field(description="UPN/email of the assignee (their Entra sign-in name). Leave all user fields empty to unassign.")] = "",
         user_name: Annotated[str, Field(description="Display name of the assignee.")] = "",
         user_id: Annotated[str, Field(description="Entra object id of the assignee, if known.")] = "",
         assigned_by: Annotated[str, Field(description="Who performed the assignment (audit comment). Empty = the signed-in analyst (local user mode) or 'AI SOC Agent (MCP)'.")] = "",
@@ -638,35 +622,6 @@ def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
         )
         return result if result.get("status") != "NOT_FOUND" else _not_found(incident_ref)
 
-    @tool("sentinel_remediate_incident", title="Execute remediation action", annotations=WRITE_DESTRUCTIVE)
-    async def sentinel_remediate_incident(
-        incident_ref: Annotated[str, Field(description=REF_DESCRIPTION, min_length=1)],
-        action_type: Annotated[str, Field(
-            description="One of: isolate_endpoint, block_ip, trigger_playbook, close_false_positive, revoke_sessions, disable_account.",
-            pattern="^(isolate_endpoint|block_ip|trigger_playbook|close_false_positive|revoke_sessions|disable_account)$",
-        )],
-        entity: Annotated[str, Field(description="Target entity: device name, IP address, or user UPN depending on the action.", min_length=1)],
-        parameters: Annotated[dict[str, Any], Field(description="Action parameters, e.g. {\"playbook_name\": \"...\"} or {\"reason\": \"...\"}. Empty object = defaults.")] = {},
-        analyst_name: Annotated[str, Field(description="Analyst / agent executing the action (audit trail). Empty = the signed-in analyst (local user mode) or 'AI SOC Agent (MCP)'.")] = "",
-    ) -> dict[str, Any]:
-        """Execute a containment / remediation action for an incident and record an audit
-        comment on it. DESTRUCTIVE: confirm with the analyst before calling.
-
-        isolate_endpoint, block_ip, trigger_playbook and close_false_positive work across
-        all delegated tenants (ARM / Defender). revoke_sessions and disable_account need
-        Microsoft Graph access to the incident's tenant: for 'log-analytics-only' workspaces
-        they return status BLOCKED_GRAPH_SCOPE with guidance instead of pretending success.
-        """
-        incident = await sentinel_client.get_incident(incident_ref)
-        if not incident:
-            return _not_found(incident_ref)
-        return await remediation_service.execute_remediation(
-            incident_id=incident["id"],
-            action_type=action_type,
-            entity=entity,
-            analyst_name=_actor(analyst_name),
-            parameters=dict(parameters) or None,
-        )
 
 
 # ------------------------------------------------------------ local tooling
@@ -773,7 +728,7 @@ def run_check(check_workspaces: bool = True) -> int:
         else:
             out.append("    ! no fleet configured (running on built-in sample workspaces). Set WORKSPACES_CONFIG_PATH and run `python -m app.mcp_server --discover-workspaces`.")
     for w in fleet:
-        out.append(f"    - {w.id:<24} {w.display_name}  [graph_mode={w.graph_mode}]")
+        out.append(f"    - {w.id:<24} {w.display_name}  [{'managing tenant' if w.is_managing_tenant else 'delegated'}]")
     if not fleet:
         ok = False
         out.append("    (none) - set WORKSPACES_CONFIG_PATH to the fleet file you were given.")

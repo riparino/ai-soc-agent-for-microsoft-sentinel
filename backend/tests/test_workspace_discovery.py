@@ -72,7 +72,8 @@ def test_merge_preserves_hand_edits_and_reports_missing():
     ids = [e["id"] for e in merged]
     assert ids == ["fabrikam", "gone", "contoso-sentinel"]            # existing order first, new appended
     fab = merged[0]
-    assert fab["display_name"] == "Fabrikam Inc" and fab["graph_client_secret"] == "s3cret"   # hand edits kept
+    assert fab["display_name"] == "Fabrikam Inc"                                             # hand edits kept
+    assert not any(k.startswith("graph") for k in fab)       # Sentinel-only fleet: Graph app fields are dropped
     assert fab["workspace_guid"].startswith("bbbbbbbb") and fab["tenant_id"] == "tenant-b"    # coordinates refreshed
     assert summary == {"added": ["contoso-sentinel"], "updated": ["fabrikam"], "missing": ["gone"]}
 
@@ -85,8 +86,8 @@ def test_rendered_fleet_file_loads_in_registry(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "WORKSPACES_CONFIG_PATH", str(path))
     reg.workspace_registry.reload()
     assert {w.id for w in reg.workspace_registry.list_workspaces()} == {"contoso-sentinel", "fab-sentinel"}
-    assert reg.workspace_registry.get("fab-sentinel").graph_mode == "log-analytics-only"
-    assert reg.workspace_registry.get("contoso-sentinel").graph_mode == "managing-tenant"
+    assert reg.workspace_registry.get("fab-sentinel").is_managing_tenant is False
+    assert reg.workspace_registry.get("contoso-sentinel").is_managing_tenant is True
 
 
 def test_relative_fleet_path_resolves_against_backend_dir(tmp_path, monkeypatch):

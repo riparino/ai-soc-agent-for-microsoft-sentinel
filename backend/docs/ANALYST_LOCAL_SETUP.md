@@ -7,6 +7,11 @@ secrets on the laptop**: the server authenticates to Azure as *you*, using your
 across every customer workspace, and every comment, assignment or closure you make
 is recorded in Sentinel under your name.
 
+The scope is **Microsoft Sentinel only**: incidents, comments, status and
+assignment, AI triage, and KQL against the customer's Log Analytics data. There are
+no Entra ID (Microsoft Graph) or Defender XDR actions here — Azure Lighthouse
+doesn't delegate those, and the Sentinel roles you already hold are all this needs.
+
 ## What you need (one-time, from your SOC admin)
 
 - You should already be a member of **`lighthouse-sentinel-responders`**, the group
@@ -72,7 +77,7 @@ access to — subscription, resource group, workspace name, Log Analytics GUID a
 customer tenant ID — written to `backend/workspaces.json` next to `.env`.
 
 - Re-run it any time a customer is onboarded or offboarded. It **merges**: ids,
-  display names and any per-customer Graph settings you edited by hand are kept,
+  display names and the managing-tenant flag you edited by hand are kept,
   coordinates are refreshed, new workspaces are appended, and workspaces you can no
   longer see are kept but flagged.
 - `--dry-run` prints the file instead of writing it; `--include-all-workspaces` also
@@ -129,10 +134,9 @@ on its own. Restart the client and try:
   get *RECENTLY_TRIAGED* pointing at the existing findings. Add `force=true` to run
   anyway (it never takes ownership away from anyone). Status changes and assignments
   are ETag-protected too: a concurrent edit returns *CONFLICT* — re-read and retry.
-- Destructive tools (close/classify, remediation) ask the client to confirm first.
-  Closing requires a classification. Identity actions (revoke sessions, disable
-  account) are refused for delegated tenants without a per-customer Graph app —
-  that's expected (Azure Lighthouse doesn't delegate Microsoft Graph).
+- Closing / reclassifying is marked destructive, so the client asks you to confirm
+  first, and closing always requires a classification. To close a false positive,
+  set status *Closed* with classification *FalsePositive* and a reason.
 - Everything you do is attributed to you: audit comments read
   *"Your Name (you@mssp.example) via AI SOC Agent (MCP)"*, and Azure records your
   identity in the customer's activity log.
@@ -158,8 +162,8 @@ on its own. Restart the client and try:
    no per-analyst Azure changes.
 2. **Fleet file**: analysts generate their own with `--discover-workspaces`
    (Azure Resource Graph, scoped to what their account can read). If you prefer a
-   curated list, publish `workspaces.json` with coordinates only, and never put
-   per-customer `graph_client_secret` values in the analysts' copy.
+   curated list, publish `workspaces.json` yourself — it holds workspace
+   coordinates only, no secrets.
 3. **Updates**: analysts `git pull` and re-run `--check`. Pinning a release tag
    avoids surprise changes.
 4. **Audit**: actions land in Sentinel comments under the analyst's identity and in

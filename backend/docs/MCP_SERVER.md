@@ -3,8 +3,7 @@
 `app/mcp_server.py` exposes the agent's capabilities as **Model Context Protocol
 (MCP)** tools, so analysts can drive fleet-wide Sentinel triage from the chat and
 coding assistants they already use. It reuses the same services as the web
-workbench (fleet registry, Sentinel client, KQL runner, triage agent, remediation
-guardrails) — nothing is duplicated, and the triage report cache is shared.
+workbench (fleet registry, Sentinel client, KQL runner, triage agent) — nothing is duplicated, and the triage report cache is shared.
 
 ## Two ways to run it
 
@@ -26,25 +25,26 @@ call routes to the right delegated tenant. Always get refs from
 
 | Tool | Kind | Purpose |
 |------|------|---------|
-| `sentinel_list_workspaces` | read | The fleet: ids (use as `workspace` selector), coordinates, `graph_mode` |
+| `sentinel_list_workspaces` | read | The fleet: ids (use as `workspace` selector) and tenant / subscription / resource-group coordinates |
 | `sentinel_list_incidents` | read | Compact summaries across one / several / `all` workspaces; filters + `limit` |
 | `sentinel_get_incident` | read | Full entity graph, alerts, comments, classification |
 | `sentinel_extract_indicators` | read | Flat, deduped IOC lists (ips, hosts, accounts, hashes, urls, azure_resources…) for hand-off to intel / asset tools |
-| `sentinel_list_tenant_users` | read | Assignees for a workspace's tenant (Graph or SigninLogs per `graph_mode`) |
 | `sentinel_triage_incident` | write | Claims the incident for the analyst (if unassigned), then runs the investigation → verdict, MITRE, evidence, RCA; returns `ALREADY_ASSIGNED` / `RECENTLY_TRIAGED` instead of duplicating work (`force` to override) |
 | `sentinel_get_triage_report` | read | Fetch an existing report |
 | `sentinel_run_kql` | read | KQL against a workspace's Log Analytics (Lighthouse-delegated) |
 | `sentinel_check_ip_reputation` / `sentinel_check_file_hash` | read | Threat-intel lookups |
 | `sentinel_add_comment` | write | Post a note to the incident in its tenant |
 | `sentinel_update_incident_status` | **destructive** | Status / severity / classification / labels; closing requires a classification |
-| `sentinel_assign_incident` | write | Assign / unassign |
-| `sentinel_remediate_incident` | **destructive** | isolate_endpoint, block_ip, trigger_playbook, close_false_positive, revoke_sessions, disable_account |
+| `sentinel_assign_incident` | write | Assign (by UPN) / unassign; `only_if_unassigned` for safe claims |
 
 Tools carry MCP annotations (`readOnlyHint`, `destructiveHint`) so well-behaved
-clients ask the analyst before destructive calls. The Microsoft Graph guardrail
-applies over MCP too: `revoke_sessions` / `disable_account` on a
-`log-analytics-only` workspace return `BLOCKED_GRAPH_SCOPE` with guidance (Azure
-Lighthouse does not delegate Graph) instead of pretending to succeed.
+clients ask the analyst before destructive calls.
+
+**Scope: Microsoft Sentinel only.** Everything above runs through Azure Resource
+Manager (Sentinel incidents API) and Log Analytics, which Azure Lighthouse delegates.
+There are deliberately no Entra ID / Microsoft Graph or Defender XDR tools here:
+neither is delegated by Lighthouse, so a server running as a Lighthouse analyst
+could not perform them honestly across customer tenants.
 
 ## Local setup (stdio) — testing on a laptop
 
@@ -236,7 +236,7 @@ Secret as the web app with that `command`, and expose it on your ingress under
   refuses incidents owned by someone else; `sentinel_update_incident_status` and
   `sentinel_assign_incident` send `If-Match`, so a concurrent change returns
   `CONFLICT` rather than overwriting it. This works across every analyst's local
-  server and the Sentinel/Defender portals because the state lives in Sentinel, not
+  server and the Sentinel portal because the state lives in Sentinel, not
   in any one process. Tune with `TRIAGE_CLAIM_ON_RUN` / `TRIAGE_DEDUPE_MINUTES`.
 - **Shared state**: the triage report cache is process-local (same as the web
   app). Reports produced over MCP are visible in the web UI only when both run in

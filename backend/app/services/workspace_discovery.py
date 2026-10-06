@@ -49,7 +49,7 @@ QUERY_SUBSCRIPTIONS = (
 )
 
 # Fields an operator may have hand-edited in an existing fleet file; preserved on merge.
-PRESERVED_FIELDS = ("id", "display_name", "graph_tenant_id", "graph_client_id", "graph_client_secret", "is_managing_tenant")
+PRESERVED_FIELDS = ("id", "display_name", "is_managing_tenant")
 
 
 def run_arg_query(query: str, token: str, timeout: float = 30.0) -> list[dict[str, Any]]:
@@ -118,7 +118,7 @@ def merge_fleet(existing: list[dict[str, Any]], discovered: list[dict[str, Any]]
     """Merge discovered entries into an existing fleet.
 
     Existing entries keep their order and any hand-edited fields (ids, display
-    names, per-customer Graph app settings, managing-tenant flag) while their
+    names, managing-tenant flag) while their
     coordinates/GUID/tenant are refreshed. Entries no longer found in Resource
     Graph are kept (the analyst may have lost access rather than the workspace
     being gone) and reported. New workspaces are appended.
