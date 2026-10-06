@@ -11,7 +11,7 @@
 >
 > ```bash
 > az login --tenant <managing-tenant-id>
-> git clone https://github.com/riparino/ai-soc-agent-for-microsoft-sentinel.git
+> git clone -b analyst-local https://github.com/riparino/ai-soc-agent-for-microsoft-sentinel.git
 > cd ai-soc-agent-for-microsoft-sentinel/backend
 > python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt   # Windows: .\venv\Scripts\Activate.ps1
 > cp .env.example .env    # set DEMO_MODE=False, AZURE_AUTH_MODE=user, AZURE_TENANT_ID, WORKSPACES_CONFIG_PATH
@@ -339,7 +339,7 @@ never persisted.
 **macOS**
 ```bash
 brew install python@3.11 node
-git clone https://github.com/riparino/ai-soc-agent-for-microsoft-sentinel.git
+git clone -b analyst-local https://github.com/riparino/ai-soc-agent-for-microsoft-sentinel.git
 cd ai-soc-agent-for-microsoft-sentinel
 
 # Backend (Terminal 1)
@@ -357,7 +357,7 @@ npm install && npm run dev      # dev UI on http://localhost:3000 (proxies /api 
 
 **Windows (PowerShell)**
 ```powershell
-git clone https://github.com/riparino/ai-soc-agent-for-microsoft-sentinel.git
+git clone -b analyst-local https://github.com/riparino/ai-soc-agent-for-microsoft-sentinel.git
 cd ai-soc-agent-for-microsoft-sentinel\backend
 python -m venv venv; .\venv\Scripts\activate
 pip install --upgrade pip; pip install -r requirements.txt

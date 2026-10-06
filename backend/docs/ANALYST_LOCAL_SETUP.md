@@ -22,7 +22,7 @@ is recorded in Sentinel under your name.
 
 ```bash
 az login --tenant <managing-tenant-id>             # your MSSP / home tenant
-git clone https://github.com/riparino/ai-soc-agent-for-microsoft-sentinel.git
+git clone -b analyst-local https://github.com/riparino/ai-soc-agent-for-microsoft-sentinel.git
 cd ai-soc-agent-for-microsoft-sentinel/backend
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
@@ -33,7 +33,7 @@ cp .env.example .env
 
 ```powershell
 az login --tenant <managing-tenant-id>
-git clone https://github.com/riparino/ai-soc-agent-for-microsoft-sentinel.git
+git clone -b analyst-local https://github.com/riparino/ai-soc-agent-for-microsoft-sentinel.git
 cd ai-soc-agent-for-microsoft-sentinel\backend
 python -m venv venv; .\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
