@@ -1,5 +1,10 @@
 # 🛡️ Microsoft Sentinel AI SOC Agent — Local Analyst MCP Server
 
+> ⚠️ **Branch rule: do not push `analyst-local` to `main`, and do not merge or
+> rebase `main` into it.** `main` is the hosted web console and is managed
+> separately (PR #1). Commit analyst-side work here only. To make git refuse an
+> accidental push to `main` from your clone: `git config core.hooksPath .githooks`.
+
 > **You are on `analyst-local`.** It holds the version each
 > analyst runs **on their own machine**: an MCP server that plugs Microsoft Sentinel
 > — across every customer workspace delegated to you via Azure Lighthouse — into
@@ -192,9 +197,10 @@ customer subscription delegated to your managing tenant).
    client secret; note the **tenant ID**, **client ID**, **client secret**.
 2. **Delegate the right Sentinel role** to that SP (or a group it belongs to) in
    your Lighthouse authorizations:
-   - **Microsoft Sentinel Responder** — read **and write** incidents (required to
-     comment, reclassify, assign, close).
-   - **Log Analytics Reader** — run KQL hunts.
+   - **Microsoft Sentinel Responder** — read **and write** incidents (comment,
+     reclassify, assign, close) **and** run KQL: the role carries
+     `Microsoft.OperationalInsights/workspaces/query/*/read`, so no separate Log
+     Analytics Reader assignment is needed.
    (Read‑only `Microsoft Sentinel Reader` works for a view‑only deployment, but the
    agent won't be able to update incidents.)
 3. **Register resource providers** `Microsoft.OperationalInsights` and
@@ -460,12 +466,22 @@ cd backend
 MCP_AUTH_MODE=entra ./run-mcp.sh --transport streamable-http --host 0.0.0.0   # shared / remote
 ```
 
-- **12 tools, Sentinel only**: list workspaces/incidents, get incident, extract
-  indicators, run AI triage (claims the incident first), fetch report, KQL, threat
-  intel, comment, status/classification, assign. Namespaced incident refs route every
-  call to the right delegated tenant; destructive tools are annotated so clients
-  confirm first. No Entra ID / Microsoft Graph or Defender XDR actions — Lighthouse
-  doesn't delegate them.
+- **14 tools, Sentinel only**: list workspaces/incidents, get incident, extract
+  indicators, list ingested tables, run the hunt catalog, run AI triage (claims the
+  incident first), fetch report, ad-hoc KQL, threat intel, comment,
+  status/classification, assign. Namespaced incident refs route every call to the
+  right delegated tenant; destructive tools are annotated so clients confirm first.
+  No Entra ID / Microsoft Graph or Defender XDR *actions* — Lighthouse doesn't
+  delegate them — but XDR *telemetry* already in Sentinel (Device*, Identity*, Email*,
+  CloudAppEvents) is hunted like any other table.
+- **Hunting covers what the workspace ingests**: tables are discovered from each
+  workspace's `Usage` table, then 31 entity-driven KQL hunts across Entra sign-in /
+  non-interactive / service-principal / managed-identity logs, AuditLogs, risky users
+  & risk detections (user and service principal), Defender XDR Device*,
+  IdentityLogonEvents, EmailEvents, CloudAppEvents, AzureActivity, AzureDiagnostics,
+  SecurityEvent, OfficeActivity, CommonSecurityLog, Syslog, SecurityAlert and both
+  TI tables are selected by the incident's entities. Live failures are reported as
+  errors (missing table, no access, bad KQL) — never as simulated rows.
 - **Local**: add `backend/run-mcp.sh` as a stdio server in Claude Code
   (`claude mcp add sentinel-soc -- /path/backend/run-mcp.sh`), Claude Desktop, or
   VS Code `.vscode/mcp.json`. Works fully in `DEMO_MODE` with no Azure.

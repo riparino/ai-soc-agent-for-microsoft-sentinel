@@ -100,6 +100,13 @@ class Settings(BaseSettings):
     TRIAGE_CLAIM_ON_RUN: bool = True
     TRIAGE_DEDUPE_MINUTES: int = 30
 
+    # Hunting: which tables a workspace ingests is read from its Usage table over
+    # this many days; at most HUNT_MAX_QUERIES catalog hunts run per triage, each
+    # returning at most HUNT_MAX_ROWS rows to the analyst / model.
+    HUNT_TABLE_LOOKBACK_DAYS: int = 7
+    HUNT_MAX_QUERIES: int = 12
+    HUNT_MAX_ROWS: int = 25
+
     # Auto-Triage & Polling Settings
     ENABLE_AUTO_POLLING: bool = False
     POLL_INTERVAL_SECONDS: int = 120

@@ -1,0 +1,17 @@
+#!/bin/sh
+# Opt-in guard for the analyst-local line of development.
+# Enable once per clone:  git config core.hooksPath .githooks
+#
+# Refuses any push that targets main/master. analyst-local is never merged into
+# main (the hosted web console); see the branch rule at the top of README.md.
+while read -r local_ref local_sha remote_ref remote_sha; do
+  case "$remote_ref" in
+    refs/heads/main|refs/heads/master)
+      echo "pre-push: refusing to push to '$remote_ref' from this clone." >&2
+      echo "          analyst-local work stays on analyst-local (README.md, 'Branch rule')." >&2
+      echo "          Bypass deliberately with: git push --no-verify" >&2
+      exit 1
+      ;;
+  esac
+done
+exit 0

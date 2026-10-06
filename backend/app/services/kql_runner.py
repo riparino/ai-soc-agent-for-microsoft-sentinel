@@ -1,6 +1,8 @@
+import asyncio
 import logging
+import time
 import httpx
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 from app.config import settings
 from app.services.workspace_registry import workspace_registry, WorkspaceConfig
@@ -16,8 +18,18 @@ class KQLRunner:
     the workspace GUID is supplied per call rather than baked into the client.
     """
 
+    # Tables a demo workspace "ingests" (drives hunt selection in DEMO_MODE / tests).
+    DEMO_TABLES = (
+        "SigninLogs", "AADNonInteractiveUserSignInLogs", "AuditLogs", "AADUserRiskEvents", "AADRiskyUsers",
+        "DeviceLogonEvents", "DeviceProcessEvents", "DeviceNetworkEvents", "DeviceInfo", "DeviceEvents",
+        "SecurityAlert", "SecurityIncident", "AzureActivity", "OfficeActivity", "CommonSecurityLog",
+        "ThreatIntelligenceIndicator", "Usage", "Heartbeat",
+    )
+    TABLE_CACHE_SECONDS = 30 * 60
+
     def __init__(self):
         self.client = None
+        self._tables_cache: Dict[str, tuple[float, List[Dict[str, Any]]]] = {}
         self._init_azure_client()
 
     def _init_azure_client(self):
@@ -49,6 +61,73 @@ class KQLRunner:
                 logger.debug(f"Could not resolve workspace GUID in KQL runner: {e}")
         return workspace
 
+    async def list_tables(
+        self,
+        workspace: Optional[WorkspaceConfig] = None,
+        days: int = 7,
+        force_refresh: bool = False,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Tables that actually received data in the last ``days`` days, from the
+        workspace's own ``Usage`` table (cheap; one row per DataType). Returns
+        ``None`` when availability cannot be determined (query failed), so callers
+        can fall back to "try every hunt and report table errors".
+        """
+        workspace = await self._resolve_workspace(workspace)
+        key = f"{workspace.id if workspace else 'default'}:{days}"
+        cached = self._tables_cache.get(key)
+        if cached and not force_refresh and time.time() - cached[0] < self.TABLE_CACHE_SECONDS:
+            return cached[1]
+
+        if settings.DEMO_MODE:
+            now = datetime.utcnow().isoformat() + "Z"
+            tables = [{"table": t, "last_record": now, "volume_mb": 1.0} for t in self.DEMO_TABLES]
+            self._tables_cache[key] = (time.time(), tables)
+            return tables
+
+        query = (
+            f"Usage | where TimeGenerated > ago({int(days)}d) "
+            "| summarize LastRecord=max(TimeGenerated), VolumeMB=round(sum(Quantity), 2) by DataType "
+            "| order by VolumeMB desc"
+        )
+        res = await self.execute_kql(query, timespan_hours=int(days) * 24 + 1, workspace=workspace)
+        if res.get("status") != "SUCCESS":
+            logger.warning("Table discovery failed for %s: %s", key, res.get("error") or res.get("status"))
+            return None
+        rows = (res.get("tables") or [{}])[0].get("rows") or []
+        tables = [
+            {"table": r.get("DataType"), "last_record": r.get("LastRecord"), "volume_mb": r.get("VolumeMB")}
+            for r in rows if r.get("DataType")
+        ]
+        self._tables_cache[key] = (time.time(), tables)
+        return tables
+
+    @staticmethod
+    def classify_error(message: str) -> str:
+        m = (message or "").lower()
+        if "resolve table" in m or "could not be resolved" in m or "semanticerror" in m and "table" in m:
+            return "TABLE_NOT_FOUND"
+        if "semantic" in m or "syntax" in m or "sem0" in m or "syn0" in m:
+            return "QUERY_INVALID"
+        if "403" in m or "forbidden" in m or "insufficientaccess" in m or "authorizationfailed" in m:
+            return "FORBIDDEN"
+        if "401" in m or "unauthorized" in m or "token" in m and "expired" in m:
+            return "NOT_AUTHENTICATED"
+        if "timeout" in m or "timed out" in m:
+            return "TIMEOUT"
+        return "QUERY_FAILED"
+
+    def _error(self, query: str, workspace: Optional[WorkspaceConfig], message: str, source: str) -> Dict[str, Any]:
+        return {
+            "status": "ERROR",
+            "error_type": self.classify_error(message),
+            "error": message[:2000],
+            "source": source,
+            "workspace_name": workspace.workspace_name if workspace else None,
+            "query": query,
+            "tables": [],
+            "row_count": 0,
+        }
+
     async def execute_kql(
         self,
         query: str,
@@ -73,11 +152,14 @@ class KQLRunner:
             try:
                 timespan = timedelta(hours=timespan_hours)
                 start_time = datetime.utcnow()
-                response = self.client.query_workspace(
+                response = await asyncio.to_thread(
+                    self.client.query_workspace,
                     workspace_id=workspace_guid,
                     query=query,
-                    timespan=timespan
+                    timespan=timespan,
                 )
+                if getattr(response, "status", None) is not None and str(response.status).lower().endswith("failure"):
+                    raise RuntimeError(str(getattr(response, "partial_error", None) or "query failed"))
                 latency_ms = int((datetime.utcnow() - start_time).total_seconds() * 1000)
 
                 tables = []
@@ -110,6 +192,7 @@ class KQLRunner:
                 }
             except Exception as e:
                 logger.warning(f"LogsQueryClient query error: {e}. Attempting direct ARM REST Query API...")
+                arm_error = None
                 # Direct ARM Log Analytics REST Query fallback (Lighthouse-honored).
                 try:
                     from app.services.sentinel_client import sentinel_client
@@ -147,10 +230,20 @@ class KQLRunner:
                                     "tables": tables,
                                     "row_count": total_rows
                                 }
+                            arm_error = f"ARM query HTTP {arm_resp.status_code}: {arm_resp.text[:500]}"
                 except Exception as arm_err:
+                    arm_error = f"{type(arm_err).__name__}: {arm_err}"
                     logger.error(f"ARM REST Query error: {arm_err}")
 
-                logger.warning(f"Live Log Analytics execution unavailable ({e}). Falling back to simulation engine.")
+                # Live mode never falls back to simulated rows: an analyst must see
+                # the real failure (missing table, no access, bad KQL), not fake data.
+                message = f"{type(e).__name__}: {e}" + (f" | fallback: {arm_error}" if arm_error else "")
+                return self._error(query, workspace, message, "AZURE_LOG_ANALYTICS")
+
+        if not settings.DEMO_MODE:
+            if not self.client:
+                return self._error(query, workspace, "No Azure credentials available for Log Analytics (sign in with `az login` or set AZURE_AUTH_MODE / service principal).", "NONE")
+            return self._error(query, workspace, f"Workspace '{workspace.id if workspace else 'default'}' has no resolvable Log Analytics workspace GUID.", "NONE")
 
         # Simulated KQL execution based on query patterns.
         query_lower = query.lower()
@@ -191,6 +284,45 @@ class KQLRunner:
                         "RiskLevelDuringSignIn": "none"
                     }
                 ]
+
+        elif "devicelogonevents" in query_lower or "identitylogonevents" in query_lower:
+            columns = ["DeviceName", "AccountUpn", "Logons", "Failed", "Types", "RemoteIPs", "Accounts", "LocalAdmin", "LastSeen"]
+            rows = [{
+                "DeviceName": "wks-exec-094.corp.contoso.com", "AccountUpn": "jdoe@cybersecurity.corp", "Logons": 14, "Failed": 9,
+                "Types": ["Network", "RemoteInteractive"], "RemoteIPs": ["185.220.101.5", "10.20.4.17"], "Accounts": ["jdoe"], "LocalAdmin": 1,
+                "LastSeen": (datetime.utcnow() - timedelta(minutes=50)).isoformat() + "Z",
+            }]
+
+        elif "aadnoninteractive" in query_lower or "auditlogs" in query_lower or "riskevents" in query_lower or "riskyusers" in query_lower:
+            columns = ["UserPrincipalName", "Events", "Failed", "IPs", "Apps", "Countries", "FromIncidentIPs", "RiskLevel", "RiskState", "LastSeen"]
+            rows = [{
+                "UserPrincipalName": "jdoe@cybersecurity.corp", "Events": 31, "Failed": 0, "IPs": ["185.220.101.5", "198.51.100.4"],
+                "Apps": ["Microsoft Office", "Azure Portal"], "Countries": ["RU", "US"], "FromIncidentIPs": 12, "RiskLevel": "high",
+                "RiskState": "atRisk", "LastSeen": (datetime.utcnow() - timedelta(minutes=20)).isoformat() + "Z",
+            }]
+
+        elif "securityalert" in query_lower:
+            columns = ["AlertName", "Alerts", "Severities", "Products", "Tactics", "FirstSeen", "LastSeen"]
+            rows = [{
+                "AlertName": "Anonymous IP address", "Alerts": 2, "Severities": ["Medium"], "Products": ["Azure Active Directory Identity Protection"],
+                "Tactics": ["InitialAccess"], "FirstSeen": (datetime.utcnow() - timedelta(days=3)).isoformat() + "Z",
+                "LastSeen": (datetime.utcnow() - timedelta(hours=2)).isoformat() + "Z",
+            }]
+
+        elif "azureactivity" in query_lower or "azurediagnostics" in query_lower:
+            columns = ["OperationNameValue", "Count", "Statuses", "Callers", "IPs", "Resources", "LastSeen"]
+            rows = [{
+                "OperationNameValue": "MICROSOFT.AUTHORIZATION/ROLEASSIGNMENTS/WRITE", "Count": 1, "Statuses": ["Succeeded"],
+                "Callers": ["jdoe@cybersecurity.corp"], "IPs": ["185.220.101.5"], "Resources": ["/subscriptions/.../resourceGroups/rg-finance"],
+                "LastSeen": (datetime.utcnow() - timedelta(hours=1)).isoformat() + "Z",
+            }]
+
+        elif "threatintel" in query_lower:
+            columns = ["IndicatorId", "ThreatType", "ConfidenceScore", "Description", "SourceSystem", "ExpirationDateTime"]
+            rows = [{
+                "IndicatorId": "ti-0001", "ThreatType": "Botnet", "ConfidenceScore": 85, "Description": "Tor exit node observed in credential stuffing",
+                "SourceSystem": "Microsoft Defender Threat Intelligence", "ExpirationDateTime": (datetime.utcnow() + timedelta(days=30)).isoformat() + "Z",
+            }]
 
         elif "deviceprocessevents" in query_lower or "securityevent" in query_lower:
             columns = ["TimeGenerated", "DeviceName", "AccountName", "FileName", "FolderPath", "ProcessCommandLine", "InitiatingProcessFileName"]

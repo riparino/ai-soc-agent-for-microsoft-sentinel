@@ -67,7 +67,11 @@ SERVER_INSTRUCTIONS = (
     "Start with sentinel_list_workspaces to see the fleet. Use sentinel_extract_indicators "
     "to get an incident's IPs, hosts, accounts and hashes as flat lists for enrichment "
     "with other tools (threat intelligence, asset/cloud inventory), then record findings "
-    "with sentinel_add_comment. Scope is Microsoft Sentinel only (incidents, comments, "
+    "with sentinel_add_comment. sentinel_list_tables shows which Log Analytics tables a "
+    "workspace ingests and sentinel_hunt_incident runs the catalog of entity-driven KQL "
+    "hunts (Entra sign-in/audit/risk, Defender XDR Device*/Identity/Email/CloudApp, "
+    "AzureActivity, AzureDiagnostics, SecurityEvent, Office, firewall, Syslog, alerts, TI) "
+    "for an incident. Scope is Microsoft Sentinel only (incidents, comments, "
     "status, assignment, Log Analytics KQL): there are no Entra ID / Microsoft Graph or "
     "Defender XDR actions, because Azure Lighthouse does not delegate those. Optional "
     "parameters use empty values ('' / 0 / []) to mean 'not set'."
@@ -290,74 +294,7 @@ def _actor(label: str) -> str:
     return actor_label(sentinel_client.credential, fallback="AI SOC Agent (MCP)")
 
 
-def _dedupe(values: list[Any]) -> list[Any]:
-    seen: set[str] = set()
-    out: list[Any] = []
-    for v in values:
-        if v is None or v == "":
-            continue
-        key = str(v).lower()
-        if key not in seen:
-            seen.add(key)
-            out.append(v)
-    return out
-
-
-def extract_indicators(incident: dict[str, Any]) -> dict[str, Any]:
-    """Flatten an incident's entity graph into per-type indicator lists.
-
-    Designed for hand-off to other tools (threat-intel enrichment of IPs/hashes,
-    asset or cloud-inventory lookups of hosts/resources), so every list is deduped
-    and contains plain strings.
-    """
-    ips: list[str] = []
-    accounts: list[str] = []
-    hosts: list[str] = []
-    hashes: list[str] = []
-    urls: list[str] = []
-    resources: list[str] = []
-    processes: list[str] = []
-    cloud_apps: list[str] = []
-    mailboxes: list[str] = []
-
-    for e in incident.get("entities") or []:
-        kind = str(e.get("kind", "")).lower()
-        if kind == "ip":
-            ips.append(e.get("address"))
-        elif kind == "account":
-            accounts.append(e.get("upn") or e.get("name"))
-        elif kind == "host":
-            hosts.append(e.get("name"))
-        elif kind == "filehash":
-            hashes.append(e.get("sha256") or e.get("name"))
-        elif kind == "url":
-            urls.append(e.get("url") or e.get("name"))
-        elif kind == "azureresource":
-            resources.append(e.get("resourceId") or e.get("name"))
-        elif kind == "process":
-            processes.append(e.get("commandLine") or e.get("processName"))
-        elif kind == "cloudapplication":
-            cloud_apps.append(e.get("name"))
-        elif kind == "mailbox":
-            mailboxes.append(e.get("name"))
-
-    # Hosts referenced by Azure resource IDs are also useful asset keys.
-    result = {
-        "incident_ref": incident.get("id"),
-        "workspace_id": incident.get("workspaceId"),
-        "workspace_name": incident.get("workspaceName"),
-        "ips": _dedupe(ips),
-        "accounts": _dedupe(accounts),
-        "hosts": _dedupe(hosts),
-        "file_hashes": _dedupe(hashes),
-        "urls": _dedupe(urls),
-        "azure_resources": _dedupe(resources),
-        "processes": _dedupe(processes),
-        "cloud_apps": _dedupe(cloud_apps),
-        "mailboxes": _dedupe(mailboxes),
-    }
-    result["counts"] = {k: len(v) for k, v in result.items() if isinstance(v, list)}
-    return result
+from app.services.indicators import extract_indicators  # noqa: E402  (shared with hunting / triage)
 
 
 def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
@@ -517,17 +454,94 @@ def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
         workspace: Annotated[str, Field(description="Workspace id to query. Empty = the default workspace. Use the incident's workspaceId when hunting for a specific incident.")] = "",
         timespan_hours: Annotated[int, Field(description="Lookback window in hours.", ge=1, le=24 * 90)] = 24,
     ) -> dict[str, Any]:
-        """Execute a KQL query against a workspace's Log Analytics data (SigninLogs,
-        DeviceProcessEvents, DeviceNetworkEvents, SecurityEvent, CommonSecurityLog…).
+        """Execute an ad-hoc KQL query against a workspace's Log Analytics data.
 
-        Works across delegated tenants via Azure Lighthouse. Returns tables with columns,
-        rows, row counts, latency, and the data source (live vs. simulated in demo mode).
+        Any ingested table works: Entra ID (SigninLogs, AADNonInteractiveUserSignInLogs,
+        AADServicePrincipalSignInLogs, AADManagedIdentitySignInLogs, AuditLogs, AADRiskyUsers,
+        AADUserRiskEvents, AADRiskyServicePrincipals, AADServicePrincipalRiskEvents), Defender
+        XDR advanced-hunting tables (DeviceProcessEvents, DeviceNetworkEvents, DeviceLogonEvents,
+        DeviceFileEvents, DeviceEvents, DeviceInfo, DeviceRegistryEvents, IdentityLogonEvents,
+        EmailEvents, CloudAppEvents…), AzureActivity, AzureDiagnostics, SecurityEvent,
+        OfficeActivity, CommonSecurityLog, Syslog, SecurityAlert, SecurityIncident, TI tables.
+        Check sentinel_list_tables first to see what this workspace actually ingests; prefer
+        sentinel_hunt_incident for the standard entity pivots.
+
+        Works across delegated tenants via Azure Lighthouse with your own Sentinel role.
+        Returns tables with columns, rows, row counts, latency and the data source, or
+        status ERROR with error_type (TABLE_NOT_FOUND, QUERY_INVALID, FORBIDDEN…) — never
+        simulated rows outside demo mode.
         """
         ws_id = _opt(workspace)
         ws = workspace_registry.get(ws_id) if ws_id else None
         if ws_id and ws is None:
             return {"error": "WORKSPACE_NOT_FOUND", "workspace": ws_id, "hint": "Use sentinel_list_workspaces for valid ids."}
         return await kql_runner.execute_kql(query, timespan_hours=timespan_hours, workspace=ws)
+
+    @tool("sentinel_list_tables", title="List ingested tables", annotations=READ_ONLY_EXTERNAL)
+    async def sentinel_list_tables(
+        workspace: Annotated[str, Field(description="Workspace id (from sentinel_list_workspaces). Empty = the default workspace.")] = "",
+        days: Annotated[int, Field(description="Only tables that received data within the last N days.", ge=1, le=90)] = 7,
+    ) -> dict[str, Any]:
+        """Which Log Analytics tables this workspace actually ingests (from its Usage
+        table), with last-record time and volume. Use it to know what you can hunt in
+        before writing KQL: e.g. whether Device* (Defender XDR), AADNonInteractiveUserSignInLogs,
+        AzureDiagnostics or OfficeActivity exist here. Also reports which catalog hunts the
+        data supports."""
+        from app.services.hunting_catalog import HUNTS
+
+        ws_id = _opt(workspace)
+        ws = workspace_registry.get(ws_id) if ws_id else None
+        if ws_id and ws is None:
+            return {"error": "WORKSPACE_NOT_FOUND", "workspace": ws_id, "hint": "Use sentinel_list_workspaces for valid ids."}
+        target = ws or workspace_registry.default()
+        tables = await kql_runner.list_tables(ws, days=days)
+        if tables is None:
+            return {"status": "UNKNOWN", "workspace_id": target.id if target else None,
+                    "message": "Could not read the workspace's Usage table (no access or query failed); hunts will run blind and report missing tables."}
+        names = {t["table"].lower() for t in tables}
+        supported = [h.id for h in HUNTS if all(t.lower() in names for t in h.tables)]
+        return {
+            "status": "SUCCESS",
+            "workspace_id": target.id if target else None,
+            "lookback_days": days,
+            "count": len(tables),
+            "tables": tables,
+            "hunts_supported": supported,
+            "hunts_unsupported": [{"id": h.id, "missing": [t for t in h.tables if t.lower() not in names]} for h in HUNTS if h.id not in supported],
+        }
+
+    @tool("sentinel_hunt_incident", title="Run catalog hunts for an incident", annotations=READ_ONLY_EXTERNAL)
+    async def sentinel_hunt_incident(
+        incident_ref: Annotated[str, Field(description=REF_DESCRIPTION, min_length=1)],
+        hunts: Annotated[str, Field(description="Comma-separated hunt ids to run (see dry_run output). Empty = every applicable hunt.")] = "",
+        families: Annotated[str, Field(description="Comma-separated families to restrict to: entra-id, defender-xdr, azure, security-logs, alerts, threat-intel. Empty = all.")] = "",
+        max_hunts: Annotated[int, Field(description="Cap on hunts per call. 0 = server default (HUNT_MAX_QUERIES).", ge=0, le=40)] = 0,
+        max_rows: Annotated[int, Field(description="Rows returned per hunt. 0 = server default (HUNT_MAX_ROWS).", ge=0, le=200)] = 0,
+        dry_run: Annotated[bool, Field(description="Plan only: return the rendered KQL for each applicable hunt without executing it.")] = False,
+    ) -> dict[str, Any]:
+        """Run the entity-driven KQL hunt catalog for an incident in its own workspace:
+        sign-in baselines and token sign-ins, risk detections, directory audit, endpoint
+        logons / processes / network / files / inventory / registry (Defender XDR Device*),
+        identity logons, email, cloud-app activity, Azure control-plane and resource logs,
+        Windows / Linux / Office / firewall logs, related alerts and TI matches.
+
+        Hunts are selected from the incident's accounts, IPs, hosts, hashes, URLs, apps and
+        resources, and from the tables the workspace ingests; skipped hunts say why. Each
+        result carries the exact KQL so the analyst can re-run or refine it with
+        sentinel_run_kql. Read-only; nothing is written to the incident."""
+        from app.services.hunting import hunt_incident
+
+        incident = await sentinel_client.get_incident(incident_ref)
+        if not incident:
+            return _not_found(incident_ref)
+        return await hunt_incident(
+            incident,
+            hunt_ids=_opt(hunts),
+            families=_opt(families),
+            max_hunts=max_hunts or None,
+            max_rows=max_rows or None,
+            dry_run=dry_run,
+        )
 
     @tool("sentinel_check_ip_reputation", title="Check IP reputation", annotations=READ_ONLY_EXTERNAL)
     async def sentinel_check_ip_reputation(

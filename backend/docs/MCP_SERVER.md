@@ -31,7 +31,9 @@ call routes to the right delegated tenant. Always get refs from
 | `sentinel_extract_indicators` | read | Flat, deduped IOC lists (ips, hosts, accounts, hashes, urls, azure_resources…) for hand-off to intel / asset tools |
 | `sentinel_triage_incident` | write | Claims the incident for the analyst (if unassigned), then runs the investigation → verdict, MITRE, evidence, RCA; returns `ALREADY_ASSIGNED` / `RECENTLY_TRIAGED` instead of duplicating work (`force` to override) |
 | `sentinel_get_triage_report` | read | Fetch an existing report |
-| `sentinel_run_kql` | read | KQL against a workspace's Log Analytics (Lighthouse-delegated) |
+| `sentinel_list_tables` | read | Which tables the workspace ingests (from `Usage`) and which catalog hunts that supports |
+| `sentinel_hunt_incident` | read | Runs the entity-driven hunt catalog (Entra sign-in / audit / risk, Defender XDR Device* / Identity / Email / CloudApp, AzureActivity, AzureDiagnostics, SecurityEvent, Office, CEF, Syslog, alerts, TI) for an incident; `dry_run` returns the KQL only |
+| `sentinel_run_kql` | read | Ad-hoc KQL against any ingested table (Lighthouse-delegated); errors reported, never simulated |
 | `sentinel_check_ip_reputation` / `sentinel_check_file_hash` | read | Threat-intel lookups |
 | `sentinel_add_comment` | write | Post a note to the incident in its tenant |
 | `sentinel_update_incident_status` | **destructive** | Status / severity / classification / labels; closing requires a classification |

@@ -105,27 +105,48 @@ class SentinelTriageAgent:
             )
             await asyncio.sleep(0.4)
 
-        # Step 3: Log Analytics KQL Execution for Behavioral Baseline
-        executed_kql_queries = []
-        kql_findings = []
+        # Step 3: Hunt across the workspace's telemetry (catalog-driven).
+        # Which tables exist is read from the workspace (Usage), so hunts cover
+        # whatever this customer actually ingests: Entra sign-in / audit / risk,
+        # Defender XDR Device* / Identity / Email / CloudApp, AzureActivity,
+        # AzureDiagnostics, SecurityEvent, Office, firewall CEF, Syslog, alerts, TI.
+        from app.services.hunting import hunt_incident
 
-        if extracted_accounts or extracted_ips:
-            kql_query = "SigninLogs | where TimeGenerated >= ago(24h) | summarize count(), make_set(IPAddress), make_set(Location) by UserPrincipalName"
-            await notify("KQL_EXECUTION", f"Hunting in Log Analytics for SigninLogs baseline: {kql_query}", {"query": kql_query})
-            res = await execute_tool_call("run_kql_query", json.dumps({"query": kql_query, "timespan_hours": 24}), workspace=workspace)
-            executed_kql_queries.append(kql_query)
-            kql_findings.append({"type": "SigninLogs", "results": res})
-            await notify("KQL_RESULT", f"Log Analytics returned {res.get('row_count', 0)} rows from SigninLogs", res)
-            await asyncio.sleep(0.6)
+        async def hunt_progress(event: str, payload: Dict[str, Any]) -> None:
+            if event == "HUNT_PLAN":
+                tables = payload.get("tables_available") or []
+                msg = (
+                    f"Workspace ingests {len(tables)} tables in the last {settings.HUNT_TABLE_LOOKBACK_DAYS}d; "
+                    f"planned {len(payload.get('planned') or [])} hunts, skipped {len(payload.get('skipped') or [])}"
+                    if payload.get("tables_checked") else
+                    f"Table inventory unavailable; running {len(payload.get('planned') or [])} applicable hunts and reporting missing tables"
+                )
+                await notify("HUNT_PLAN", msg, payload)
+            elif event == "KQL_EXECUTION":
+                await notify("KQL_EXECUTION", f"Hunting [{payload.get('id')}] {payload.get('title')} ({', '.join(payload.get('tables') or [])})", {"query": payload.get("query"), "hunt": payload.get("id")})
+            elif event == "KQL_RESULT":
+                if payload.get("status") == "SUCCESS":
+                    await notify("KQL_RESULT", f"[{payload.get('id')}] {payload.get('row_count', 0)} rows from {', '.join(payload.get('tables') or [])}", payload)
+                else:
+                    await notify("KQL_ERROR", f"[{payload.get('id')}] {payload.get('error_type')}: {str(payload.get('error') or '')[:200]}", payload)
 
-        if extracted_hosts or extracted_processes:
-            kql_query = "DeviceProcessEvents | where InitiatingProcessFileName =~ 'WINWORD.EXE' or FileName =~ 'powershell.exe' | take 5"
-            await notify("KQL_EXECUTION", f"Hunting for suspicious parent-child process lineage: {kql_query}", {"query": kql_query})
-            res = await execute_tool_call("run_kql_query", json.dumps({"query": kql_query, "timespan_hours": 12}), workspace=workspace)
-            executed_kql_queries.append(kql_query)
-            kql_findings.append({"type": "DeviceProcessEvents", "results": res})
-            await notify("KQL_RESULT", f"Log Analytics returned {res.get('row_count', 0)} process events", res)
-            await asyncio.sleep(0.6)
+        hunt = await hunt_incident(incident, workspace=workspace, max_rows=10, progress=hunt_progress)
+        executed_kql_queries = [h["query"] for h in hunt["hunts"] if h.get("status") == "SUCCESS"]
+        kql_findings = [
+            {
+                "hunt": h["id"], "type": h["title"], "tables": h["tables"], "purpose": h["purpose"],
+                "status": h["status"], "row_count": h.get("row_count", 0), "rows": h.get("rows", []),
+                **({"error_type": h.get("error_type"), "error": h.get("error")} if h.get("status") != "SUCCESS" else {}),
+            }
+            for h in hunt["hunts"]
+        ]
+        data_coverage = {
+            "tables_checked": hunt["tables"]["checked"],
+            "tables_available": hunt["tables"]["available"],
+            "hunts_skipped": hunt["skipped"],
+            "summary": hunt["summary"],
+        }
+        await asyncio.sleep(0.2)
 
         # Step 4: True/False Positive Reasoning & Verdict Synthesis
         await notify("REASONING", "Synthesizing evidence with AI reasoning engine, calculating confidence score, and mapping to MITRE ATT&CK tactics...")
@@ -142,6 +163,7 @@ class SentinelTriageAgent:
                         "content": json.dumps({
                             "incident": incident,
                             "threat_intel": ti_results,
+                            "data_coverage": data_coverage,
                             "kql_findings": kql_findings
                         })
                     }
@@ -167,6 +189,8 @@ class SentinelTriageAgent:
                         raise param_err
 
                 verdict_json = json.loads(response.choices[0].message.content)
+                verdict_json.setdefault("kql_queries_used", executed_kql_queries)
+                verdict_json["hunting"] = {"summary": hunt["summary"], "tables_available": hunt["tables"]["available"], "skipped": hunt["skipped"]}
                 await notify("VERDICT_GENERATED", f"AI Triage completed with verdict: {verdict_json.get('verdict')}", verdict_json)
                 
                 # Auto-post comment to Sentinel if enabled
@@ -397,6 +421,7 @@ class SentinelTriageAgent:
             "evidence_findings": evidence,
             "recommended_actions": recommendations,
             "kql_queries_used": executed_kql_queries,
+            "hunting": {"summary": hunt["summary"], "tables_available": hunt["tables"]["available"], "skipped": hunt["skipped"]},
             "root_cause_analysis": rca_data,
             "suggested_sentinel_status": "Closed" if verdict == "FALSE_POSITIVE" and settings.AUTO_CLOSE_FALSE_POSITIVES else "Active",
             "suggested_classification": "FalsePositive" if verdict == "FALSE_POSITIVE" else "TruePositive" if verdict == "TRUE_POSITIVE" else "Undetermined",

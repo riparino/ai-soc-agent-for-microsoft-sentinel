@@ -27,6 +27,8 @@ EXPECTED_TOOLS = {
     "sentinel_triage_incident",
     "sentinel_get_triage_report",
     "sentinel_run_kql",
+    "sentinel_list_tables",
+    "sentinel_hunt_incident",
     "sentinel_check_ip_reputation",
     "sentinel_check_file_hash",
     "sentinel_add_comment",

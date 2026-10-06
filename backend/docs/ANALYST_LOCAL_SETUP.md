@@ -15,8 +15,10 @@ doesn't delegate those, and the Sentinel roles you already hold are all this nee
 ## What you need (one-time, from your SOC admin)
 
 - You should already be a member of **`lighthouse-sentinel-responders`**, the group
-  that holds the Lighthouse authorizations (**Microsoft Sentinel Responder** +
-  **Log Analytics Reader** on the customer subscriptions). Nothing to request —
+  that holds the **Microsoft Sentinel Responder** authorization in every customer's
+  Lighthouse delegation. That one role covers everything this server does — read and
+  update incidents **and** run KQL (it includes
+  `Microsoft.OperationalInsights/workspaces/query/*/read`). Nothing to request —
   if a customer workspace later shows `403`, that group's delegation is what to check.
 - Our managing tenant ID.
 - Python 3.11+, Git, and the **Azure CLI** (`az`).
@@ -141,6 +143,33 @@ on its own. Restart the client and try:
   *"Your Name (you@mssp.example) via AI SOC Agent (MCP)"*, and Azure records your
   identity in the customer's activity log.
 
+## What triage actually looks at
+
+Triage and `sentinel_hunt_incident` don't run a fixed pair of queries. For each
+incident the server first reads the workspace's **`Usage`** table to learn which
+Log Analytics tables received data in the last 7 days, then runs the hunts from the
+catalog (`app/services/hunting_catalog.py`, 31 hunts) whose tables exist and whose
+indicators the incident has — accounts, IPs, hosts, hashes, URLs, apps, resources:
+
+| Family | Tables | What it pivots on |
+|--------|--------|-------------------|
+| Entra ID | `SigninLogs`, `AADNonInteractiveUserSignInLogs`, `AADServicePrincipalSignInLogs`, `AADManagedIdentitySignInLogs`, `AuditLogs`, `AADRiskyUsers`, `AADUserRiskEvents`, `AADRiskyServicePrincipals`, `AADServicePrincipalRiskEvents` | interactive & token sign-in baselines, who else used the incident IPs, workload-identity sign-ins, risk state & detections, directory changes |
+| Defender XDR telemetry | `DeviceLogonEvents`, `DeviceProcessEvents`, `DeviceNetworkEvents`, `DeviceFileEvents`, `DeviceEvents`, `DeviceInfo`, `DeviceRegistryEvents`, `IdentityLogonEvents`, `EmailEvents`, `EmailUrlInfo`, `CloudAppEvents` | endpoint logons, LOLBin / encoded command lines, connections to the C2, hash sightings & executions, device inventory, AV/ASR/tamper events, registry persistence, on-prem AD logons, phishing mail & URLs, SaaS activity |
+| Azure | `AzureActivity`, `AzureDiagnostics` | control-plane operations and resource logs (Key Vault, Firewall, SQL, App Gateway…) by the accounts / from the IPs / on the resources |
+| Security logs | `SecurityEvent`, `OfficeActivity`, `CommonSecurityLog`, `Syslog` | Windows logon / process / account events, M365 operations, firewall & proxy sessions, Linux auth |
+| Alerts & TI | `SecurityAlert`, `ThreatIntelIndicators`, `ThreatIntelligenceIndicator` | other alerts naming the same entities; TI matches on IPs, URLs, domains, hashes |
+
+- Tables your customer doesn't ingest are **skipped and listed** as such, so the
+  report says what it could *not* see. If the `Usage` table can't be read, every
+  applicable hunt runs and a missing table shows up as a `TABLE_NOT_FOUND` error.
+- Every hunt result carries its exact KQL. Ask for a dry run ("show me the hunts you
+  would run") to get the queries without executing them, or refine one with
+  `sentinel_run_kql`.
+- Outside demo mode a failed query is reported as an error (`TABLE_NOT_FOUND`,
+  `QUERY_INVALID`, `FORBIDDEN`…), never replaced with sample rows.
+- Need another pivot? Add a `Hunt(...)` to the catalog: table(s), indicator kinds,
+  window, purpose, KQL template. It's picked up by triage and the MCP tool automatically.
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -156,10 +185,11 @@ on its own. Restart the client and try:
 
 ## For the SOC admin: rolling this out
 
-1. **Lighthouse**: `lighthouse-sentinel-responders` carries Sentinel Responder +
-   Log Analytics Reader in each customer delegation; analysts are already members,
-   so onboarding a customer means authorizing that group in the new delegation —
-   no per-analyst Azure changes.
+1. **Lighthouse**: `lighthouse-sentinel-responders` carries **Microsoft Sentinel
+   Responder** in each customer delegation (incidents + KQL); analysts are already
+   members, so onboarding a customer means authorizing that group in the new
+   delegation — no per-analyst Azure changes. Analysts `az login` to the managing
+   tenant once; Lighthouse projects every delegated workspace into that session.
 2. **Fleet file**: analysts generate their own with `--discover-workspaces`
    (Azure Resource Graph, scoped to what their account can read). If you prefer a
    curated list, publish `workspaces.json` yourself — it holds workspace
@@ -169,3 +199,6 @@ on its own. Restart the client and try:
 4. **Audit**: actions land in Sentinel comments under the analyst's identity and in
    the customer tenant's Azure Activity Log; the local server keeps no state worth
    backing up (triage reports are in-memory).
+5. **Branch rule**: this code lives on `analyst-local` only. **Never push it to
+   `main`** (the hosted web console) or merge `main` back in. Opt-in guard for your
+   clone: `git config core.hooksPath .githooks` makes git refuse a push to `main`.
