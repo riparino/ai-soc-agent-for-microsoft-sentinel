@@ -331,31 +331,27 @@ class SentinelClient:
     def __init__(self):
         self.credential = None
         self.is_live = False
+        self.auth_mode = "none"
         self._init_client()
 
     def _init_client(self):
-        """(Re)build the shared home-tenant credential and live/demo state."""
-        has_creds = bool(
-            (settings.USE_MANAGED_IDENTITY) or
-            (settings.AZURE_TENANT_ID and settings.AZURE_CLIENT_ID and settings.AZURE_CLIENT_SECRET)
-        )
-        self.is_live = bool(not settings.DEMO_MODE and has_creds)
+        """(Re)build the shared managing-tenant credential and live/demo state.
+
+        The credential comes from ``azure_credentials.build_credential`` so the
+        Sentinel client, KQL runner and MCP server share one identity: a service
+        principal / managed identity on servers, or the signed-in analyst
+        (``AZURE_AUTH_MODE=user``) when running locally.
+        """
+        from app.services.azure_credentials import build_credential, has_live_credentials, resolve_auth_mode
+
+        self.auth_mode = resolve_auth_mode()
+        self.is_live = bool(not settings.DEMO_MODE and has_live_credentials())
         self.credential = None
 
         if self.is_live:
             try:
-                from azure.identity import DefaultAzureCredential, ClientSecretCredential
-                if settings.USE_MANAGED_IDENTITY:
-                    self.credential = DefaultAzureCredential()
-                elif settings.AZURE_TENANT_ID and settings.AZURE_CLIENT_ID and settings.AZURE_CLIENT_SECRET:
-                    self.credential = ClientSecretCredential(
-                        tenant_id=settings.AZURE_TENANT_ID,
-                        client_id=settings.AZURE_CLIENT_ID,
-                        client_secret=settings.AZURE_CLIENT_SECRET
-                    )
-                else:
-                    self.credential = DefaultAzureCredential()
-                logger.info("Initialized shared (managing-tenant) Azure credential for the workspace fleet.")
+                self.credential = build_credential()
+                logger.info("Initialized Azure credential for the workspace fleet (auth mode: %s).", self.auth_mode)
             except Exception as e:
                 logger.warning(f"Could not initialize Azure credentials: {e}. Running in simulation/demo mode.")
                 self.is_live = False
@@ -374,8 +370,8 @@ class SentinelClient:
                 return token_obj.token
             except Exception:
                 pass
-        # Direct OAuth2 REST token fallback (managing tenant).
-        if settings.AZURE_TENANT_ID and settings.AZURE_CLIENT_ID and settings.AZURE_CLIENT_SECRET:
+        # Direct OAuth2 REST token fallback (service-principal mode only).
+        if getattr(self, "auth_mode", None) == "service_principal" and settings.AZURE_TENANT_ID and settings.AZURE_CLIENT_ID and settings.AZURE_CLIENT_SECRET:
             try:
                 token_url = f"https://login.microsoftonline.com/{settings.AZURE_TENANT_ID}/oauth2/v2.0/token"
                 data = {

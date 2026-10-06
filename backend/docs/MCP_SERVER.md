@@ -48,6 +48,11 @@ Lighthouse does not delegate Graph) instead of pretending to succeed.
 
 ## Local setup (stdio) — testing on a laptop
 
+> Rolling this out to every analyst? Use **`AZURE_AUTH_MODE=user`** so each person
+> authenticates as themselves with `az login` (no secrets on laptops, per-analyst
+> attribution) — step-by-step in **[ANALYST_LOCAL_SETUP.md](ANALYST_LOCAL_SETUP.md)**.
+> `./run-mcp.sh --check` diagnoses an install; `--print-config <client>` prints the snippet.
+
 ```bash
 cd backend
 python -m venv venv && source venv/bin/activate     # Windows: .\venv\Scripts\activate

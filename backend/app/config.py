@@ -1,3 +1,4 @@
+import os
 from pydantic_settings import BaseSettings
 from typing import Optional, List
 
@@ -32,6 +33,17 @@ class Settings(BaseSettings):
     AZURE_WORKSPACE_NAME: Optional[str] = None
     AZURE_WORKSPACE_ID: Optional[str] = None # Log Analytics Workspace ID (customerId GUID)
     USE_MANAGED_IDENTITY: bool = False
+
+    # How this process authenticates to Azure (see services/azure_credentials.py):
+    #   auto (default)     - USE_MANAGED_IDENTITY, else the service-principal secret above
+    #   service_principal  - shared server deployments
+    #   managed_identity   - AKS / Container Apps / VMs
+    #   user               - the signed-in analyst (az login) - for running the MCP server
+    #                        locally on each analyst's machine; no secrets on the laptop and
+    #                        every Sentinel action is attributed to the analyst.
+    AZURE_AUTH_MODE: str = "auto"
+    # In user mode, fall back to an interactive browser login when no CLI session exists.
+    AZURE_INTERACTIVE_LOGIN: bool = False
 
     # Multi-workspace / multi-tenant fleet registry (Azure Lighthouse).
     # Provide the full fleet of delegated Microsoft Sentinel workspaces either as
@@ -87,7 +99,10 @@ class Settings(BaseSettings):
     AUTO_CLOSE_FALSE_POSITIVES: bool = False
     
     class Config:
-        env_file = ".env"
+        # Load the backend's own .env regardless of the process working directory
+        # (MCP clients such as Claude Desktop launch the server from an arbitrary
+        # cwd); a .env in the cwd still takes precedence when present.
+        env_file = (os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"), ".env")
         extra = "ignore"
 
 settings = Settings()

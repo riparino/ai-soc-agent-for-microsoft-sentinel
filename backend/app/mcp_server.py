@@ -271,6 +271,20 @@ def _opt(value: str) -> Optional[str]:
     return value or None
 
 
+def _actor(label: str) -> str:
+    """Actor recorded in Sentinel audit comments.
+
+    An explicit label wins; otherwise the signed-in analyst when the server runs
+    with AZURE_AUTH_MODE=user (local per-analyst mode), else a generic agent label.
+    """
+    explicit = _opt(label)
+    if explicit:
+        return explicit
+    from app.services.azure_credentials import actor_label
+    from app.services.sentinel_client import sentinel_client
+    return actor_label(sentinel_client.credential, fallback="AI SOC Agent (MCP)")
+
+
 def _dedupe(values: list[Any]) -> list[Any]:
     seen: set[str] = set()
     out: list[Any] = []
@@ -539,12 +553,12 @@ def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
     async def sentinel_add_comment(
         incident_ref: Annotated[str, Field(description=REF_DESCRIPTION, min_length=1)],
         message: Annotated[str, Field(description="Markdown comment to post on the incident.", min_length=1, max_length=20000)],
-        author: Annotated[str, Field(description="Author label recorded with the comment.")] = "AI SOC Agent (MCP)",
+        author: Annotated[str, Field(description="Author label recorded with the comment. Empty = the signed-in analyst (local user mode) or 'AI SOC Agent (MCP)'.")] = "",
     ) -> dict[str, Any]:
         """Post an investigation note / comment to the incident in its own Sentinel
         workspace — e.g. enrichment results from other tools. Non-destructive; the
         comment is appended to the incident's timeline."""
-        result = await sentinel_client.add_comment(incident_ref, message, author=author)
+        result = await sentinel_client.add_comment(incident_ref, message, author=_actor(author))
         return result if result.get("status") != "NOT_FOUND" else _not_found(incident_ref)
 
     @tool("sentinel_update_incident_status", title="Update incident status / classification", annotations=WRITE_DESTRUCTIVE)
@@ -556,7 +570,7 @@ def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
         classification_reason: Annotated[str, Field(description="Sentinel classification reason, e.g. SuspiciousActivity, InaccurateData, SuspiciousButExpected. Empty = default for the classification.")] = "",
         classification_comment: Annotated[str, Field(description="Closing notes recorded on the incident. Empty = default note.")] = "",
         labels: Annotated[list[str], Field(description="Labels/tags to apply to the incident. Empty list = unchanged.")] = [],
-        updated_by: Annotated[str, Field(description="Analyst / agent name recorded in the audit comment.")] = "AI SOC Agent (MCP)",
+        updated_by: Annotated[str, Field(description="Analyst / agent name recorded in the audit comment. Empty = the signed-in analyst (local user mode) or 'AI SOC Agent (MCP)'.")] = "",
     ) -> dict[str, Any]:
         """Change an incident's status, severity, classification, or labels in its Sentinel
         workspace. Closing an incident is a significant action: confirm with the analyst
@@ -575,7 +589,7 @@ def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
             classification_reason=_opt(classification_reason),
             classification_comment=_opt(classification_comment),
             labels=list(labels) or None,
-            updated_by=updated_by,
+            updated_by=_actor(updated_by),
         )
         return result if result.get("status") != "NOT_FOUND" else _not_found(incident_ref)
 
@@ -585,7 +599,7 @@ def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
         user_upn: Annotated[str, Field(description="UPN/email of the assignee (from sentinel_list_tenant_users). Leave all user fields empty to unassign.")] = "",
         user_name: Annotated[str, Field(description="Display name of the assignee.")] = "",
         user_id: Annotated[str, Field(description="Entra object id of the assignee, if known.")] = "",
-        assigned_by: Annotated[str, Field(description="Who performed the assignment (audit comment).")] = "AI SOC Agent (MCP)",
+        assigned_by: Annotated[str, Field(description="Who performed the assignment (audit comment). Empty = the signed-in analyst (local user mode) or 'AI SOC Agent (MCP)'.")] = "",
     ) -> dict[str, Any]:
         """Assign an incident to a SOC engineer in its tenant, or unassign it when all user
         fields are empty. Posts an audit comment on the incident."""
@@ -595,7 +609,7 @@ def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
             user_name=_opt(user_name),
             user_email=_opt(user_upn),
             user_upn=_opt(user_upn),
-            assigned_by=assigned_by,
+            assigned_by=_actor(assigned_by),
         )
         return result if result.get("status") != "NOT_FOUND" else _not_found(incident_ref)
 
@@ -608,7 +622,7 @@ def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
         )],
         entity: Annotated[str, Field(description="Target entity: device name, IP address, or user UPN depending on the action.", min_length=1)],
         parameters: Annotated[dict[str, Any], Field(description="Action parameters, e.g. {\"playbook_name\": \"...\"} or {\"reason\": \"...\"}. Empty object = defaults.")] = {},
-        analyst_name: Annotated[str, Field(description="Analyst / agent executing the action (audit trail).")] = "AI SOC Agent (MCP)",
+        analyst_name: Annotated[str, Field(description="Analyst / agent executing the action (audit trail). Empty = the signed-in analyst (local user mode) or 'AI SOC Agent (MCP)'.")] = "",
     ) -> dict[str, Any]:
         """Execute a containment / remediation action for an incident and record an audit
         comment on it. DESTRUCTIVE: confirm with the analyst before calling.
@@ -625,9 +639,117 @@ def _register_tools(mcp: FastMCP, disabled: set[str]) -> None:
             incident_id=incident["id"],
             action_type=action_type,
             entity=entity,
-            analyst_name=analyst_name,
+            analyst_name=_actor(analyst_name),
             parameters=dict(parameters) or None,
         )
+
+
+# ------------------------------------------------------------ local tooling
+BACKEND_DIR = str(__import__("pathlib").Path(__file__).resolve().parent.parent)
+CLIENT_CONFIG_TARGETS = ("claude-desktop", "claude-code", "vscode")
+
+
+def client_config(target: str) -> str:
+    """Render the MCP client configuration for running this server locally over
+    stdio with the current interpreter. PYTHONPATH makes `app.*` importable from
+    any working directory; settings load the backend's own .env regardless of cwd.
+    """
+    import json
+
+    python = sys.executable
+    args = ["-m", "app.mcp_server", "--transport", "stdio"]
+    env = {"PYTHONPATH": BACKEND_DIR}
+    if target == "claude-desktop":
+        return json.dumps({"mcpServers": {"sentinel-soc": {"command": python, "args": args, "env": env}}}, indent=2)
+    if target == "vscode":
+        return json.dumps({"servers": {"sentinel-soc": {"type": "stdio", "command": python, "args": args, "env": env}}}, indent=2)
+    if target == "claude-code":
+        return f"claude mcp add sentinel-soc -e PYTHONPATH={BACKEND_DIR} -- {python} {' '.join(args)}"
+    raise ValueError(f"unknown client config target {target!r}; choose from {', '.join(CLIENT_CONFIG_TARGETS)}")
+
+
+def run_check(check_workspaces: bool = True) -> int:
+    """Self-diagnosis for a local (per-analyst) install. Prints a report to stdout
+    and returns a process exit code (0 = ready)."""
+    import asyncio
+
+    from app.services.azure_credentials import get_signed_in_identity, resolve_auth_mode
+    from app.services.sentinel_client import sentinel_client
+
+    ok = True
+    out: list[str] = []
+    mode = resolve_auth_mode()
+    out.append("Sentinel AI SOC Agent MCP server - local check")
+    out.append(f"  Backend dir   : {BACKEND_DIR}")
+    out.append(f"  Python        : {sys.executable}")
+    out.append(f"  DEMO_MODE     : {settings.DEMO_MODE}")
+    out.append(f"  Auth mode     : {mode}")
+
+    if settings.DEMO_MODE:
+        out.append("  Azure         : not contacted (DEMO_MODE=True). Set DEMO_MODE=False for live Sentinel.")
+    elif not sentinel_client.is_live:
+        ok = False
+        out.append("  Azure         : NOT LIVE - no usable credentials. For a local analyst install set AZURE_AUTH_MODE=user and run `az login --tenant <managing-tenant-id>`.")
+    else:
+        identity = get_signed_in_identity(sentinel_client.credential)
+        if identity:
+            out.append(f"  Signed in as  : {identity.get('name')} <{identity.get('upn') or '-'}> ({identity.get('kind')}, tenant {identity.get('tenant_id')})")
+        else:
+            ok = False
+            out.append("  Signed in as  : FAILED to obtain an ARM token. Run `az login --tenant <managing-tenant-id>` (or check AZURE_AUTH_MODE / service-principal settings).")
+
+    fleet = workspace_registry.list_workspaces()
+    out.append(f"  Workspaces    : {len(fleet)} loaded (source: {workspace_registry._source})")
+    for w in fleet:
+        out.append(f"    - {w.id:<24} {w.display_name}  [graph_mode={w.graph_mode}]")
+    if not fleet:
+        ok = False
+        out.append("    (none) - set WORKSPACES_CONFIG_PATH to the fleet file you were given.")
+
+    if check_workspaces and sentinel_client.is_live and fleet:
+        token = sentinel_client._get_arm_token()
+        if token:
+            async def probe(ws):
+                if not ws.has_arm_coordinates():
+                    return ws.id, "SKIP (no ARM coordinates)"
+                try:
+                    async with httpx.AsyncClient(timeout=10.0) as client:
+                        r = await client.get(ws.arm_workspace_url(), headers={"Authorization": f"Bearer {token}"})
+                    if r.status_code == 200:
+                        return ws.id, "OK"
+                    if r.status_code == 403:
+                        return ws.id, "403 - no delegated role on this workspace (check Lighthouse authorization)"
+                    if r.status_code == 404:
+                        return ws.id, "404 - subscription/resource group/workspace name not found"
+                    return ws.id, f"HTTP {r.status_code}"
+                except Exception as e:  # noqa: BLE001
+                    return ws.id, f"ERROR {type(e).__name__}"
+
+            async def probe_all():
+                sem = asyncio.Semaphore(10)
+                async def one(ws):
+                    async with sem:
+                        return await probe(ws)
+                return await asyncio.gather(*[one(ws) for ws in fleet])
+
+            results = asyncio.run(probe_all())
+            out.append("  Reachability  :")
+            for wid, status in results:
+                if status != "OK" and not status.startswith("SKIP"):
+                    ok = False
+                out.append(f"    - {wid:<24} {status}")
+
+    server = create_server(auth_mode="none")
+    tool_names = sorted(t.name for t in asyncio.run(server.list_tools()))
+    disabled = _split_csv(settings.MCP_DISABLED_TOOLS)
+    out.append(f"  Tools         : {len(tool_names)} registered" + (f" ({len(disabled)} disabled via MCP_DISABLED_TOOLS)" if disabled else ""))
+    llm = bool((settings.LLM_PROVIDER == "azure_openai" and settings.AZURE_OPENAI_ENDPOINT and settings.AZURE_OPENAI_API_KEY) or settings.OPENAI_API_KEY)
+    out.append(f"  Server LLM    : {'configured' if llm else 'not configured - fine for MCP use: your MCP client is the reasoning engine; sentinel_triage_incident uses the built-in deterministic engine'}")
+    out.append("")
+    out.append("READY" if ok else "NOT READY - fix the items above and re-run --check")
+    out.append("Next: python -m app.mcp_server --print-config claude-desktop   (or vscode / claude-code)")
+    print("\n".join(out))
+    return 0 if ok else 1
 
 
 # ------------------------------------------------------------------------ CLI
@@ -650,7 +772,16 @@ def main(argv: Optional[list[str]] = None) -> None:
         default=None,
         help=f"Bearer auth for the HTTP transport (default: MCP_AUTH_MODE={settings.MCP_AUTH_MODE}).",
     )
+    parser.add_argument("--check", action="store_true", help="Self-diagnose a local install (auth, identity, fleet, workspace reachability, tools) and exit.")
+    parser.add_argument("--no-workspace-probe", action="store_true", help="With --check: skip probing each workspace over ARM.")
+    parser.add_argument("--print-config", choices=list(CLIENT_CONFIG_TARGETS), default=None, help="Print the MCP client configuration for this install and exit.")
     args = parser.parse_args(argv)
+
+    if args.print_config:
+        print(client_config(args.print_config))
+        return
+    if args.check:
+        sys.exit(run_check(check_workspaces=not args.no_workspace_probe))
 
     auth_mode = args.auth or settings.MCP_AUTH_MODE
     if args.transport == "stdio":

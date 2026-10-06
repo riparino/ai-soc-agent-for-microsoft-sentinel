@@ -434,6 +434,10 @@ MCP_AUTH_MODE=entra ./run-mcp.sh --transport streamable-http --host 0.0.0.0   # 
 - **Local**: add `backend/run-mcp.sh` as a stdio server in Claude Code
   (`claude mcp add sentinel-soc -- /path/backend/run-mcp.sh`), Claude Desktop, or
   VS Code `.vscode/mcp.json`. Works fully in `DEMO_MODE` with no Azure.
+- **Per-analyst local mode**: `AZURE_AUTH_MODE=user` makes the server authenticate as
+  the signed-in analyst (`az login`) — no secrets on laptops, every Sentinel action
+  attributed to them; `--check` self-diagnoses the install and `--print-config`
+  emits the client snippet. Runbook: [`backend/docs/ANALYST_LOCAL_SETUP.md`](backend/docs/ANALYST_LOCAL_SETUP.md).
 - **Remote**: Streamable HTTP with **Microsoft Entra ID** bearer auth
   (`MCP_AUTH_MODE=entra`, `MCP_ENTRA_AUDIENCE=<app id>`): tokens are validated
   against your tenant's JWKS and the server publishes RFC 9728 protected‑resource

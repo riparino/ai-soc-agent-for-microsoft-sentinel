@@ -21,28 +21,17 @@ class KQLRunner:
         self._init_azure_client()
 
     def _init_azure_client(self):
-        has_creds = bool(
-            (settings.USE_MANAGED_IDENTITY) or
-            (settings.AZURE_TENANT_ID and settings.AZURE_CLIENT_ID and settings.AZURE_CLIENT_SECRET)
-        )
-        if not settings.DEMO_MODE and has_creds:
+        from app.services.azure_credentials import build_credential, has_live_credentials, resolve_auth_mode
+
+        if not settings.DEMO_MODE and has_live_credentials():
             try:
-                from azure.identity import DefaultAzureCredential, ClientSecretCredential
                 from azure.monitor.query import LogsQueryClient
 
-                if settings.USE_MANAGED_IDENTITY:
-                    credential = DefaultAzureCredential()
-                elif settings.AZURE_TENANT_ID and settings.AZURE_CLIENT_ID and settings.AZURE_CLIENT_SECRET:
-                    credential = ClientSecretCredential(
-                        tenant_id=settings.AZURE_TENANT_ID,
-                        client_id=settings.AZURE_CLIENT_ID,
-                        client_secret=settings.AZURE_CLIENT_SECRET
-                    )
-                else:
-                    credential = DefaultAzureCredential()
-
+                # Same identity as the Sentinel client (service principal, managed
+                # identity, or the signed-in analyst in AZURE_AUTH_MODE=user).
+                credential = build_credential()
                 self.client = LogsQueryClient(credential)
-                logger.info("Initialized shared Azure Monitor LogsQueryClient for the workspace fleet.")
+                logger.info("Initialized Azure Monitor LogsQueryClient for the workspace fleet (auth mode: %s).", resolve_auth_mode())
             except Exception as e:
                 logger.warning(f"Failed to initialize Azure Monitor client (fallback to simulation): {e}")
                 self.client = None
